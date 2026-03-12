@@ -1,0 +1,31 @@
+# Ignore only the raw dataset folder
+Data/
+outputs/
+
+# Ignore large/binary experiment artifacts
+*.h5
+*.npy
+
+# Ignore Excel files
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.xltx
+*.xltm
+
+# Ignore pickle artifacts
+*.pickle
+*.pkl
+
+# Local app/runtime artifacts
+keymap_config.json
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Labeling app runtime outputs
+Labeling/Label_DataSet/
+Labeling/keymap_config.json
