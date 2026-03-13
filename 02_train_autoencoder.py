@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import random
 from pathlib import Path
 from typing import Any
@@ -28,54 +29,99 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 
+from excel_export_utils import export_stage_workbook
+
 
 # ============================================================================
 # Editable configuration
 # ============================================================================
-PROJECT_ROOT = Path(__file__).resolve().parent
+class TrainConfig:
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+    RUN_NAME = "test_dataset_260312_preprocess_v2"
 
-PATHS = {
-    "output_root": PROJECT_ROOT / "outputs",
-}
-
-RUN_NAME = "test_dataset_260312_preprocess_v1"
-
-DATA = {
-    "preprocess_root": PATHS["output_root"] / RUN_NAME / "preprocess",
-    "training_root": PATHS["output_root"] / RUN_NAME / "training",
-    "required_metadata_columns": [
+    PREPROCESS_ROOT = OUTPUT_ROOT / RUN_NAME / "preprocess"
+    TRAINING_ROOT = OUTPUT_ROOT / RUN_NAME / "training"
+    REQUIRED_METADATA_COLUMNS = [
         "sample_id",
         "subject_id",
         "recording_id",
         "valid_flag",
-    ],
+    ]
+
+    HIDDEN_UNITS = [64, 32]
+    LATENT_DIM = 8
+    ACTIVATION = "relu"
+    OUTPUT_ACTIVATION = "linear"
+    LOSS = "mse"
+    OPTIMIZER_LEARNING_RATE = 1e-3
+
+    VALIDATION_FRACTION = 0.20
+    BATCH_SIZE = 64
+    EPOCHS = 200
+    EARLY_STOPPING_PATIENCE = 20
+    TENSORBOARD_HISTOGRAM_FREQ = 0
+    VERBOSE = 2
+
+    EXCEL_EXPORT_ENABLED = True
+    EXCEL_FILENAME = "training_data_export.xlsx"
+    EXCEL_FREEZE_PANES = "A2"
+    EXCEL_HEADER_FILL = "1F4E78"
+    EXCEL_HEADER_FONT_COLOR = "FFFFFF"
+    EXCEL_MAX_COLUMN_WIDTH = 40
+
+    RANDOM_SEED = 42
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+PATHS = {
+    "output_root": TrainConfig.OUTPUT_ROOT,
+}
+
+RUN_NAME = TrainConfig.RUN_NAME
+
+DATA = {
+    "preprocess_root": TrainConfig.PREPROCESS_ROOT,
+    "training_root": TrainConfig.TRAINING_ROOT,
+    "required_metadata_columns": TrainConfig.REQUIRED_METADATA_COLUMNS,
 }
 
 PREPROCESS = {}
 
 MODEL = {
-    "hidden_units": [64, 32],
-    "latent_dim": 8,
-    "activation": "relu",
-    "output_activation": "linear",
-    "loss": "mse",
-    "optimizer_learning_rate": 1e-3,
+    "hidden_units": TrainConfig.HIDDEN_UNITS,
+    "latent_dim": TrainConfig.LATENT_DIM,
+    "activation": TrainConfig.ACTIVATION,
+    "output_activation": TrainConfig.OUTPUT_ACTIVATION,
+    "loss": TrainConfig.LOSS,
+    "optimizer_learning_rate": TrainConfig.OPTIMIZER_LEARNING_RATE,
 }
 
 TRAINING = {
-    "validation_fraction": 0.20,
-    "batch_size": 64,
-    "epochs": 200,
-    "early_stopping_patience": 20,
-    "tensorboard_histogram_freq": 0,
-    "verbose": 2,
+    "validation_fraction": TrainConfig.VALIDATION_FRACTION,
+    "batch_size": TrainConfig.BATCH_SIZE,
+    "epochs": TrainConfig.EPOCHS,
+    "early_stopping_patience": TrainConfig.EARLY_STOPPING_PATIENCE,
+    "tensorboard_histogram_freq": TrainConfig.TENSORBOARD_HISTOGRAM_FREQ,
+    "verbose": TrainConfig.VERBOSE,
 }
 
 EMBEDDING = {}
 
 CLUSTERING = {}
 
-RANDOM_SEED = 42
+EXCEL = {
+    "export_enabled": TrainConfig.EXCEL_EXPORT_ENABLED,
+    "filename": TrainConfig.EXCEL_FILENAME,
+    "freeze_panes": TrainConfig.EXCEL_FREEZE_PANES,
+    "header_fill": TrainConfig.EXCEL_HEADER_FILL,
+    "header_font_color": TrainConfig.EXCEL_HEADER_FONT_COLOR,
+    "max_column_width": TrainConfig.EXCEL_MAX_COLUMN_WIDTH,
+}
+
+RANDOM_SEED = TrainConfig.RANDOM_SEED
 
 
 # ============================================================================
@@ -415,6 +461,58 @@ def reconstruction_error_table(
     return output
 
 
+def export_training_excel(
+    training_root: Path,
+    training_summary: dict[str, Any],
+    history: tf.keras.callbacks.History,
+    reconstruction_table: pd.DataFrame,
+) -> Path:
+    """Export training-stage artifacts to an Excel workbook."""
+    overview_rows: list[dict[str, Any]] = []
+    for key in [
+        "run_name",
+        "input_dimension",
+        "num_training_samples",
+        "num_validation_samples",
+        "latent_dimension",
+        "best_validation_loss",
+        "final_training_loss",
+        "final_validation_loss",
+        "split_column",
+        "tensorflow_version",
+    ]:
+        overview_rows.append({"section": "summary", "metric": key, "value": training_summary[key]})
+
+    for key, value in training_summary["reconstruction_error"].items():
+        overview_rows.append({"section": "reconstruction_error", "metric": key, "value": value})
+
+    for key, value in training_summary["hyperparameters"].items():
+        if isinstance(value, list):
+            value = json.dumps(value)
+        overview_rows.append({"section": "hyperparameters", "metric": key, "value": value})
+
+    history_df = pd.DataFrame(history.history)
+    history_df.insert(0, "epoch", np.arange(1, len(history_df) + 1, dtype=int))
+    train_groups_df = pd.DataFrame({"train_group": training_summary["train_groups"]})
+    validation_groups_df = pd.DataFrame({"validation_group": training_summary["validation_groups"]})
+
+    workbook_path = training_root / EXCEL["filename"]
+    return export_stage_workbook(
+        workbook_path=workbook_path,
+        sheets={
+            "Overview": pd.DataFrame(overview_rows),
+            "Training_History": history_df,
+            "Reconstruction_Error": reconstruction_table,
+            "Train_Groups": train_groups_df,
+            "Validation_Groups": validation_groups_df,
+        },
+        freeze_panes=EXCEL["freeze_panes"],
+        header_fill=EXCEL["header_fill"],
+        header_font_color=EXCEL["header_font_color"],
+        max_column_width=EXCEL["max_column_width"],
+    )
+
+
 def main() -> None:
     """Train the autoencoder on preprocessed cycle-level features."""
     set_random_seed(RANDOM_SEED)
@@ -541,11 +639,22 @@ def main() -> None:
     ) as file:
         json.dump(training_summary, file, indent=2)
 
-    print(f"Saved training outputs to: {output_paths['training_root']}")
-    print(f"Input dimension: {input_dim}")
-    print(f"Training samples: {x_train.shape[0]}")
-    print(f"Validation samples: {x_validation.shape[0]}")
-    print(f"Best validation loss: {compact_history['best_validation_loss']}")
+    excel_path = None
+    if EXCEL["export_enabled"]:
+        excel_path = export_training_excel(
+            training_root=output_paths["training_root"],
+            training_summary=training_summary,
+            history=history,
+            reconstruction_table=reconstruction_table,
+        )
+
+    logger.info("Saved training outputs to: %s", output_paths["training_root"])
+    if excel_path is not None:
+        logger.info("Saved training Excel export to: %s", excel_path)
+    logger.info("Input dimension: %s", input_dim)
+    logger.info("Training samples: %s", x_train.shape[0])
+    logger.info("Validation samples: %s", x_validation.shape[0])
+    logger.info("Best validation loss: %s", compact_history["best_validation_loss"])
 
 
 if __name__ == "__main__":

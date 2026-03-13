@@ -18,6 +18,7 @@ Saved artifacts:
 from __future__ import annotations
 
 import json
+import logging
 import random
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,8 @@ import pandas as pd
 import tensorflow as tf
 from sklearn.decomposition import PCA
 
+from excel_export_utils import export_stage_workbook
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -37,24 +40,54 @@ import matplotlib.pyplot as plt
 # ============================================================================
 # Editable configuration
 # ============================================================================
-PROJECT_ROOT = Path(__file__).resolve().parent
+class EmbeddingConfig:
+    PROJECT_ROOT = Path(__file__).resolve().parent
+    OUTPUT_ROOT = PROJECT_ROOT / "outputs"
+    RUN_NAME = "test_dataset_260312_preprocess_v2"
 
-PATHS = {
-    "output_root": PROJECT_ROOT / "outputs",
-}
-
-RUN_NAME = "test_dataset_260312_preprocess_v1"
-
-DATA = {
-    "preprocess_root": PATHS["output_root"] / RUN_NAME / "preprocess",
-    "training_root": PATHS["output_root"] / RUN_NAME / "training",
-    "clustering_root": PATHS["output_root"] / RUN_NAME / "clustering",
-    "required_metadata_columns": [
+    PREPROCESS_ROOT = OUTPUT_ROOT / RUN_NAME / "preprocess"
+    TRAINING_ROOT = OUTPUT_ROOT / RUN_NAME / "training"
+    CLUSTERING_ROOT = OUTPUT_ROOT / RUN_NAME / "clustering"
+    REQUIRED_METADATA_COLUMNS = [
         "sample_id",
         "subject_id",
         "recording_id",
         "valid_flag",
-    ],
+    ]
+
+    PREDICT_BATCH_SIZE = 256
+
+    MIN_CLUSTER_SIZE = 10
+    MIN_SAMPLES = 5
+    METRIC = "euclidean"
+    CLUSTER_SELECTION_METHOD = "eom"
+    PREDICTION_DATA = True
+    PCA_COMPONENTS = 2
+
+    EXCEL_EXPORT_ENABLED = True
+    EXCEL_FILENAME = "clustering_data_export.xlsx"
+    EXCEL_FREEZE_PANES = "A2"
+    EXCEL_HEADER_FILL = "1F4E78"
+    EXCEL_HEADER_FONT_COLOR = "FFFFFF"
+    EXCEL_MAX_COLUMN_WIDTH = 40
+
+    RANDOM_SEED = 42
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+PATHS = {
+    "output_root": EmbeddingConfig.OUTPUT_ROOT,
+}
+
+RUN_NAME = EmbeddingConfig.RUN_NAME
+
+DATA = {
+    "preprocess_root": EmbeddingConfig.PREPROCESS_ROOT,
+    "training_root": EmbeddingConfig.TRAINING_ROOT,
+    "clustering_root": EmbeddingConfig.CLUSTERING_ROOT,
+    "required_metadata_columns": EmbeddingConfig.REQUIRED_METADATA_COLUMNS,
 }
 
 PREPROCESS = {}
@@ -64,19 +97,28 @@ MODEL = {}
 TRAINING = {}
 
 EMBEDDING = {
-    "predict_batch_size": 256,
+    "predict_batch_size": EmbeddingConfig.PREDICT_BATCH_SIZE,
 }
 
 CLUSTERING = {
-    "min_cluster_size": 10,
-    "min_samples": 5,
-    "metric": "euclidean",
-    "cluster_selection_method": "eom",
-    "prediction_data": True,
-    "pca_components": 2,
+    "min_cluster_size": EmbeddingConfig.MIN_CLUSTER_SIZE,
+    "min_samples": EmbeddingConfig.MIN_SAMPLES,
+    "metric": EmbeddingConfig.METRIC,
+    "cluster_selection_method": EmbeddingConfig.CLUSTER_SELECTION_METHOD,
+    "prediction_data": EmbeddingConfig.PREDICTION_DATA,
+    "pca_components": EmbeddingConfig.PCA_COMPONENTS,
 }
 
-RANDOM_SEED = 42
+EXCEL = {
+    "export_enabled": EmbeddingConfig.EXCEL_EXPORT_ENABLED,
+    "filename": EmbeddingConfig.EXCEL_FILENAME,
+    "freeze_panes": EmbeddingConfig.EXCEL_FREEZE_PANES,
+    "header_fill": EmbeddingConfig.EXCEL_HEADER_FILL,
+    "header_font_color": EmbeddingConfig.EXCEL_HEADER_FONT_COLOR,
+    "max_column_width": EmbeddingConfig.EXCEL_MAX_COLUMN_WIDTH,
+}
+
+RANDOM_SEED = EmbeddingConfig.RANDOM_SEED
 
 
 # ============================================================================
@@ -391,6 +433,77 @@ def clustering_summary(
     return summary
 
 
+def export_clustering_excel(
+    clustering_root: Path,
+    summary: dict[str, Any],
+    embedding_metadata: pd.DataFrame,
+    assignments: pd.DataFrame,
+    embeddings: np.ndarray,
+) -> Path:
+    """Export clustering-stage tables to an Excel workbook."""
+    overview_rows: list[dict[str, Any]] = []
+    for key in [
+        "run_name",
+        "total_valid_samples",
+        "latent_dimension",
+        "number_of_clusters_excluding_noise",
+        "number_of_noise_samples",
+        "noise_ratio",
+    ]:
+        overview_rows.append({"section": "summary", "metric": key, "value": summary[key]})
+
+    for key, value in summary["hdbscan_parameters"].items():
+        overview_rows.append({"section": "hdbscan_parameters", "metric": key, "value": value})
+
+    if "membership_probability" in summary:
+        for key, value in summary["membership_probability"].items():
+            overview_rows.append({"section": "membership_probability", "metric": key, "value": value})
+
+    cluster_size_df = pd.DataFrame(
+        [
+            {"cluster_label": int(label), "sample_count": count}
+            for label, count in summary["cluster_sizes"].items()
+        ]
+    )
+    embedding_frame = pd.DataFrame(
+        embeddings,
+        columns=[f"embedding_dim_{index}" for index in range(embeddings.shape[1])],
+    )
+    embedding_view = pd.concat(
+        [
+            embedding_metadata.reset_index(drop=True),
+            assignments.drop(
+                columns=[
+                    "sample_id",
+                    "subject_id",
+                    "recording_id",
+                    "feature_row_index",
+                    "waveform_row_index",
+                ],
+                errors="ignore",
+            ).reset_index(drop=True),
+            embedding_frame,
+        ],
+        axis=1,
+    )
+
+    workbook_path = clustering_root / EXCEL["filename"]
+    return export_stage_workbook(
+        workbook_path=workbook_path,
+        sheets={
+            "Overview": pd.DataFrame(overview_rows),
+            "Cluster_Sizes": cluster_size_df,
+            "Embedding_Metadata": embedding_metadata,
+            "Cluster_Assignments": assignments,
+            "Embedding_View": embedding_view,
+        },
+        freeze_panes=EXCEL["freeze_panes"],
+        header_fill=EXCEL["header_fill"],
+        header_font_color=EXCEL["header_font_color"],
+        max_column_width=EXCEL["max_column_width"],
+    )
+
+
 def main() -> None:
     """Extract embeddings, run HDBSCAN, and save clustering artifacts."""
     set_random_seed(RANDOM_SEED)
@@ -459,13 +572,25 @@ def main() -> None:
     with open(clustering_root / "clustering_summary.json", "w", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)
 
-    print(f"Saved clustering outputs to: {clustering_root}")
-    print(f"Embedding shape: {embeddings.shape}")
-    print(
-        "Clusters excluding noise: "
-        f"{summary['number_of_clusters_excluding_noise']}"
+    excel_path = None
+    if EXCEL["export_enabled"]:
+        excel_path = export_clustering_excel(
+            clustering_root=clustering_root,
+            summary=summary,
+            embedding_metadata=embedding_metadata,
+            assignments=assignments,
+            embeddings=embeddings,
+        )
+
+    logger.info("Saved clustering outputs to: %s", clustering_root)
+    if excel_path is not None:
+        logger.info("Saved clustering Excel export to: %s", excel_path)
+    logger.info("Embedding shape: %s", embeddings.shape)
+    logger.info(
+        "Clusters excluding noise: %s",
+        summary["number_of_clusters_excluding_noise"],
     )
-    print(f"Noise samples: {summary['number_of_noise_samples']}")
+    logger.info("Noise samples: %s", summary["number_of_noise_samples"])
 
 
 if __name__ == "__main__":

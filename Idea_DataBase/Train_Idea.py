@@ -3,13 +3,15 @@
 Create a standalone script named 02_train_autoencoder.py.
 
 Goal:
-Train an unsupervised autoencoder on the cycle-level feature matrix produced by 01_preprocess.py. The purpose is to learn a compact latent representation of heart sound cycles that preserves important structural and temporal information for later clustering.
+Train an unsupervised autoencoder on the cycle-level numeric feature matrix produced by 01_preprocess.py. The purpose is to learn a compact latent representation of each heart sound cycle in feature space.
 
 Important context:
-- Use the feature-based cycle input created in the preprocessing stage.
-- Do not use raw waveform input in this first training script.
-- This is unsupervised learning. Do not use labels.
-- The encoder output will later be used as the latent embedding for HDBSCAN.
+- This is a tabular feature-learning task, not a raw time-series reconstruction task.
+- The model input is a fixed-length numeric feature vector for each cycle.
+- Do not use raw waveform tensors as model input.
+- Do not build sequence models such as 1D CNN, RNN, LSTM, or Transformer for this stage.
+- Use a simple dense autoencoder for tabular numeric data.
+- The encoder output will later be used for HDBSCAN clustering.
 
 Inputs to load:
 outputs/{RUN_NAME}/preprocess/cycle_features.npy
@@ -24,13 +26,13 @@ Required behavior:
 
 Model requirements:
 - Use TensorFlow/Keras.
-- Build a simple and readable dense autoencoder appropriate for tabular feature vectors.
-- Make hidden layer sizes and latent dimension configurable at the top of the script.
-- Include feature normalization in a reproducible way.
-- Prefer a Keras Normalization layer adapted on training data only, so the preprocessing behavior is part of the saved model.
+- Build a simple dense autoencoder for tabular features.
+- Make hidden layer sizes, activation, dropout, and latent dimension configurable.
+- Normalize features in a reproducible way using training data only.
+- Prefer a Keras Normalization layer adapted on training data only.
 - Use reconstruction loss only.
-- Default to MSE loss unless clearly configurable.
-- Keep the initial architecture conservative and easy to inspect.
+- Default to MSE loss unless configured otherwise.
+- Keep the model small, readable, and easy to inspect.
 
 Training requirements:
 - Set random seed in a reproducible way.
@@ -62,14 +64,14 @@ The training summary should include:
 - key hyperparameters
 
 Implementation guidance:
-- Add comments explaining tensor shapes.
+- Add comments explaining feature matrix shape.
 - Keep code clear for a new lab member.
 - Fail loudly if feature matrix shape is invalid.
 - Do not perform clustering in this script.
 - Do not add unnecessary abstraction.
 
 Done when:
-- the script trains end-to-end on the preprocessed feature matrix
+- the script trains end-to-end on the feature matrix
 - encoder and autoencoder are saved
 - training history is saved
 - reconstruction metrics are saved

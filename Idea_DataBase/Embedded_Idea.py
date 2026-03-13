@@ -3,13 +3,13 @@
 Create a standalone script named 03_extract_embeddings_and_hdbscan.py.
 
 Goal:
-Load the trained encoder and the preprocessed cycle features, extract latent embeddings for all valid cycles, apply HDBSCAN in latent space, and save clustering outputs for later interpretation.
+Load the trained encoder and the preprocessed cycle feature matrix, extract latent embeddings for all valid cycles, apply HDBSCAN in latent space, and save clustering outputs for later interpretation.
 
 Important context:
-- This stage must use the encoder trained in 02_train_autoencoder.py.
+- This stage operates on tabular feature embeddings.
 - Do not retrain the model here.
-- The latent representation is the main input for clustering.
-- HDBSCAN should discover stable density-based groups and leave ambiguous samples as noise.
+- Each sample corresponds to one heart sound cycle represented by one numeric feature vector.
+- HDBSCAN should discover stable density-based groups in latent feature space.
 
 Inputs to load:
 outputs/{RUN_NAME}/preprocess/cycle_features.npy
@@ -60,12 +60,12 @@ The clustering summary must include at least:
 
 Visualization:
 - Create a simple 2D PCA scatter plot colored by cluster label.
-- Treat this plot as visualization only, not as proof of cluster quality.
-- Do not use the 2D plot alone to interpret cluster meaning.
+- Use this only as a compact visualization of latent feature space.
+- Do not interpret cluster meaning from the 2D scatter alone.
 
 Implementation guidance:
 - Keep the code straightforward and reproducible.
-- Save enough information for the interpretation stage to join clustering results back to waveforms and metadata.
+- Save enough information for the interpretation stage to join cluster assignments back to feature statistics and metadata.
 - Do not use labels or supervised evaluation.
 - Do not silently skip failures.
 
