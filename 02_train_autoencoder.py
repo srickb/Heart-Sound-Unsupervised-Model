@@ -1,256 +1,128 @@
 """
-Standalone autoencoder training script for cycle-level heart sound features.
+Representation learning script fixed to the current unsupervised design.
 
 Expected input files:
-- outputs/{RUN_NAME}/preprocess/cycle_features.npy
-- outputs/{RUN_NAME}/preprocess/cycle_metadata.csv
-- outputs/{RUN_NAME}/preprocess/feature_names.json
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/beat_features_valid.csv
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/learning_input_columns.json
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/feature_names.json
 
 Saved artifacts:
-- outputs/{RUN_NAME}/training/autoencoder.keras
-- outputs/{RUN_NAME}/training/encoder.keras
-- outputs/{RUN_NAME}/training/model_summary.txt
+- outputs/{RUN_NAME}/training/dae_best.pt
+- outputs/{RUN_NAME}/training/scaler.joblib
 - outputs/{RUN_NAME}/training/training_history.csv
-- outputs/{RUN_NAME}/training/training_summary.json
-- outputs/{RUN_NAME}/training/tensorboard/
-- outputs/{RUN_NAME}/training/reconstruction_error_summary.csv
+- outputs/{RUN_NAME}/training/latent_valid.csv
+- outputs/{RUN_NAME}/training/split_info.json
 """
 
 from __future__ import annotations
 
-import io
 import json
 import logging
-import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import torch
+from sklearn.preprocessing import RobustScaler
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
-from excel_export_utils import export_stage_workbook
 
-
-# ============================================================================
-# Editable configuration
-# ============================================================================
-class TrainConfig:
+class TrainingConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
+    INPUT_ROOT = PROJECT_ROOT / "outputs" / "beat_level_preprocess_fixed" / "preprocess"
     OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-    RUN_NAME = "test_dataset_260312_preprocess_v2"
-
-    PREPROCESS_ROOT = OUTPUT_ROOT / RUN_NAME / "preprocess"
-    TRAINING_ROOT = OUTPUT_ROOT / RUN_NAME / "training"
-    REQUIRED_METADATA_COLUMNS = [
-        "sample_id",
-        "subject_id",
-        "recording_id",
-        "valid_flag",
-    ]
-
-    HIDDEN_UNITS = [64, 32]
-    LATENT_DIM = 8
-    ACTIVATION = "relu"
-    OUTPUT_ACTIVATION = "linear"
-    LOSS = "mse"
-    OPTIMIZER_LEARNING_RATE = 1e-3
-
-    VALIDATION_FRACTION = 0.20
-    BATCH_SIZE = 64
-    EPOCHS = 200
-    EARLY_STOPPING_PATIENCE = 20
-    TENSORBOARD_HISTOGRAM_FREQ = 0
-    VERBOSE = 2
-
-    EXCEL_EXPORT_ENABLED = True
-    EXCEL_FILENAME = "training_data_export.xlsx"
-    EXCEL_FREEZE_PANES = "A2"
-    EXCEL_HEADER_FILL = "1F4E78"
-    EXCEL_HEADER_FONT_COLOR = "FFFFFF"
-    EXCEL_MAX_COLUMN_WIDTH = 40
-
+    RUN_NAME = "representation_learning_fixed"
     RANDOM_SEED = 42
+    LATENT_DIM = 12
+    BATCH_SIZE = 256
+    MAX_EPOCHS = 100
+    EARLY_STOPPING_PATIENCE = 15
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-5
+    MASK_RATIO = 0.15
+    TRAIN_RATIO = 0.70
+    VAL_RATIO = 0.15
+    TEST_RATIO = 0.15
+
+    BEAT_FEATURES_FILENAME = "beat_features_valid.csv"
+    LEARNING_INPUT_COLUMNS_FILENAME = "learning_input_columns.json"
+    FEATURE_NAMES_FILENAME = "feature_names.json"
+    MODEL_FILENAME = "dae_best.pt"
+    SCALER_FILENAME = "scaler.joblib"
+    TRAINING_HISTORY_FILENAME = "training_history.csv"
+    LATENT_FILENAME = "latent_valid.csv"
+    SPLIT_INFO_FILENAME = "split_info.json"
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-PATHS = {
-    "output_root": TrainConfig.OUTPUT_ROOT,
-}
 
-RUN_NAME = TrainConfig.RUN_NAME
-
-DATA = {
-    "preprocess_root": TrainConfig.PREPROCESS_ROOT,
-    "training_root": TrainConfig.TRAINING_ROOT,
-    "required_metadata_columns": TrainConfig.REQUIRED_METADATA_COLUMNS,
-}
-
-PREPROCESS = {}
-
-MODEL = {
-    "hidden_units": TrainConfig.HIDDEN_UNITS,
-    "latent_dim": TrainConfig.LATENT_DIM,
-    "activation": TrainConfig.ACTIVATION,
-    "output_activation": TrainConfig.OUTPUT_ACTIVATION,
-    "loss": TrainConfig.LOSS,
-    "optimizer_learning_rate": TrainConfig.OPTIMIZER_LEARNING_RATE,
-}
-
-TRAINING = {
-    "validation_fraction": TrainConfig.VALIDATION_FRACTION,
-    "batch_size": TrainConfig.BATCH_SIZE,
-    "epochs": TrainConfig.EPOCHS,
-    "early_stopping_patience": TrainConfig.EARLY_STOPPING_PATIENCE,
-    "tensorboard_histogram_freq": TrainConfig.TENSORBOARD_HISTOGRAM_FREQ,
-    "verbose": TrainConfig.VERBOSE,
-}
-
-EMBEDDING = {}
-
-CLUSTERING = {}
-
-EXCEL = {
-    "export_enabled": TrainConfig.EXCEL_EXPORT_ENABLED,
-    "filename": TrainConfig.EXCEL_FILENAME,
-    "freeze_panes": TrainConfig.EXCEL_FREEZE_PANES,
-    "header_fill": TrainConfig.EXCEL_HEADER_FILL,
-    "header_font_color": TrainConfig.EXCEL_HEADER_FONT_COLOR,
-    "max_column_width": TrainConfig.EXCEL_MAX_COLUMN_WIDTH,
-}
-
-RANDOM_SEED = TrainConfig.RANDOM_SEED
+REQUIRED_METADATA_COLUMNS = [
+    "record_id",
+    "beat_index",
+    "valid_flag",
+]
 
 
-# ============================================================================
-# Dataset adapter section
-# ============================================================================
-def load_preprocess_outputs(
-    preprocess_root: Path,
-    required_metadata_columns: list[str],
-) -> tuple[np.ndarray, pd.DataFrame, list[str]]:
-    """
-    Load the feature matrix and aligned valid-cycle metadata from preprocessing.
+@dataclass
+class SplitData:
+    train_frame: pd.DataFrame
+    val_frame: pd.DataFrame
+    test_frame: pd.DataFrame
+    train_records: list[str]
+    val_records: list[str]
+    test_records: list[str]
 
-    Expected input schema:
-    - cycle_features.npy: shape (num_valid_cycles, num_features)
-    - cycle_metadata.csv: row-based metadata including valid_flag and sample_id
-    - feature_names.json: one name per feature column
 
-    Output:
-        features: float32 array with shape (num_valid_cycles, num_features)
-        valid_metadata: DataFrame aligned 1:1 with features
-        feature_names: list with length num_features
-    """
-    feature_path = preprocess_root / "cycle_features.npy"
-    metadata_path = preprocess_root / "cycle_metadata.csv"
-    feature_names_path = preprocess_root / "feature_names.json"
-
-    for path in [feature_path, metadata_path, feature_names_path]:
-        if not path.exists():
-            raise FileNotFoundError(f"Required preprocess artifact is missing: {path}")
-
-    features = np.load(feature_path).astype(np.float32)
-    metadata = pd.read_csv(metadata_path)
-    with open(feature_names_path, "r", encoding="utf-8") as file:
-        feature_names = json.load(file)
-
-    missing_columns = [
-        column for column in required_metadata_columns if column not in metadata.columns
-    ]
-    if missing_columns:
-        raise ValueError(f"Missing required metadata columns: {missing_columns}")
-
-    if features.ndim != 2 or features.shape[0] == 0 or features.shape[1] == 0:
-        raise ValueError(f"Invalid feature matrix shape: {features.shape}")
-    if len(feature_names) != features.shape[1]:
-        raise ValueError(
-            "Feature name count does not match feature matrix width: "
-            f"{len(feature_names)} vs {features.shape[1]}"
+class DenoisingAutoencoder(nn.Module):
+    def __init__(self, input_dim: int, latent_dim: int) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, latent_dim),
         )
-    if np.isnan(features).any() or np.isinf(features).any():
-        raise ValueError("Feature matrix contains NaN or Inf values.")
-
-    valid_metadata = metadata.loc[metadata["valid_flag"] == True].copy()
-    if valid_metadata.empty:
-        raise ValueError("No valid cycles found in metadata.")
-    if valid_metadata["sample_id"].astype(str).duplicated().any():
-        raise ValueError("sample_id must be unique across valid cycles.")
-
-    if len(valid_metadata) != features.shape[0]:
-        raise ValueError(
-            "Number of valid metadata rows does not match feature rows: "
-            f"{len(valid_metadata)} vs {features.shape[0]}"
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, input_dim),
         )
 
-    # Prefer an explicit global feature index when available. This is the
-    # safest alignment check because the feature matrix is saved row-wise.
-    if "feature_row_index" in valid_metadata.columns:
-        feature_row_index = valid_metadata["feature_row_index"].dropna().to_numpy()
-        if (
-            len(feature_row_index) == len(valid_metadata)
-            and len(np.unique(feature_row_index)) == len(valid_metadata)
-            and np.array_equal(
-                np.sort(feature_row_index.astype(int)),
-                np.arange(len(valid_metadata), dtype=int),
-            )
-        ):
-            valid_metadata["feature_row_index"] = valid_metadata["feature_row_index"].astype(int)
-            valid_metadata = valid_metadata.sort_values(
-                by="feature_row_index", kind="stable"
-            ).reset_index(drop=True)
-            return features, valid_metadata, feature_names
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        latent = self.encoder(x)
+        return self.decoder(latent)
 
-    sort_columns = [
-        column
-        for column in ["recording_id", "cycle_index"]
-        if column in valid_metadata.columns
-    ]
-    if not sort_columns:
-        raise ValueError(
-            "Unable to infer valid-cycle alignment. Expected feature_row_index or "
-            "recording_id/cycle_index in metadata."
-        )
-    valid_metadata = valid_metadata.sort_values(
-        by=sort_columns, kind="stable"
-    ).reset_index(drop=True)
-
-    return features, valid_metadata, feature_names
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
 
 
-# ============================================================================
-# Utility functions
-# ============================================================================
 def set_random_seed(seed: int) -> None:
-    """Set reproducible random seeds for Python, NumPy, and TensorFlow."""
-    random.seed(seed)
     np.random.seed(seed)
-    tf.keras.utils.set_random_seed(seed)
-    try:
-        tf.config.experimental.enable_op_determinism()
-    except Exception:
-        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def ensure_output_directories(output_root: Path, run_name: str) -> dict[str, Path]:
-    """Create stable output directories for this run."""
     run_root = output_root / run_name
     preprocess_root = run_root / "preprocess"
     training_root = run_root / "training"
     clustering_root = run_root / "clustering"
     interpretation_root = run_root / "interpretation"
-    tensorboard_root = training_root / "tensorboard"
 
-    for path in [
-        run_root,
-        preprocess_root,
-        training_root,
-        clustering_root,
-        interpretation_root,
-        tensorboard_root,
-    ]:
+    for path in [preprocess_root, training_root, clustering_root, interpretation_root]:
         path.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -259,402 +131,427 @@ def ensure_output_directories(output_root: Path, run_name: str) -> dict[str, Pat
         "training_root": training_root,
         "clustering_root": clustering_root,
         "interpretation_root": interpretation_root,
-        "tensorboard_root": tensorboard_root,
     }
 
 
-def choose_split_column(metadata: pd.DataFrame) -> str:
-    """
-    Select the group column used for train/validation splitting.
-
-    Output:
-        "subject_id" when available, otherwise "recording_id".
-    """
-    if "subject_id" in metadata.columns and metadata["subject_id"].notna().all():
-        if metadata["subject_id"].astype(str).nunique() >= 2:
-            return "subject_id"
-    if "recording_id" not in metadata.columns:
-        raise ValueError("Metadata must contain subject_id or recording_id for splitting.")
-    if metadata["recording_id"].astype(str).nunique() < 2:
-        raise ValueError("At least two unique groups are required for train/validation split.")
-    return "recording_id"
+def load_json_list(file_path: Path) -> list[str]:
+    values = json.loads(file_path.read_text(encoding="utf-8"))
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise ValueError(f"Expected JSON string list: {file_path}")
+    return values
 
 
-def group_train_validation_split(
-    metadata: pd.DataFrame,
-    validation_fraction: float,
-    random_seed: int,
-) -> tuple[np.ndarray, np.ndarray, str, list[str], list[str]]:
-    """
-    Split samples into train/validation at the group level.
+def load_representation_inputs(input_root: Path) -> tuple[pd.DataFrame, list[str], list[str]]:
+    logger.info("입력 파일 로드 시작: %s", input_root)
+    beat_features_path = input_root / TrainingConfig.BEAT_FEATURES_FILENAME
+    learning_input_columns_path = input_root / TrainingConfig.LEARNING_INPUT_COLUMNS_FILENAME
+    feature_names_path = input_root / TrainingConfig.FEATURE_NAMES_FILENAME
 
-    Input:
-        metadata: DataFrame aligned to features with shape (num_samples, num_columns).
-        validation_fraction: Fraction of groups assigned to validation.
-    Output:
-        train_mask: bool array with shape (num_samples,)
-        validation_mask: bool array with shape (num_samples,)
-        split_column: grouping column name
-        train_groups: ordered group labels used for training
-        validation_groups: ordered group labels used for validation
-    """
-    split_column = choose_split_column(metadata)
-    groups = metadata[split_column].astype(str).drop_duplicates().tolist()
-    if len(groups) < 2:
-        raise ValueError("Need at least two unique groups for train/validation split.")
-
-    rng = np.random.default_rng(random_seed)
-    shuffled_groups = groups.copy()
-    rng.shuffle(shuffled_groups)
-
-    num_validation_groups = max(1, int(round(len(shuffled_groups) * validation_fraction)))
-    num_validation_groups = min(num_validation_groups, len(shuffled_groups) - 1)
-    validation_groups = shuffled_groups[:num_validation_groups]
-    train_groups = shuffled_groups[num_validation_groups:]
-
-    group_values = metadata[split_column].astype(str).to_numpy()
-    validation_mask = np.isin(group_values, validation_groups)
-    train_mask = ~validation_mask
-
-    if train_mask.sum() == 0 or validation_mask.sum() == 0:
-        raise ValueError("Train/validation split produced an empty split.")
-
-    return train_mask, validation_mask, split_column, train_groups, validation_groups
-
-
-def build_autoencoder(
-    input_dim: int,
-    hidden_units: list[int],
-    latent_dim: int,
-    activation: str,
-    output_activation: str,
-    learning_rate: float,
-    normalizer: tf.keras.layers.Normalization,
-) -> tuple[tf.keras.Model, tf.keras.Model]:
-    """
-    Build a dense tabular autoencoder and its encoder view.
-
-    Tensor shapes:
-    - input tensor: (batch, input_dim)
-    - latent tensor: (batch, latent_dim)
-    - reconstruction tensor: (batch, input_dim)
-    """
-    inputs = tf.keras.Input(shape=(input_dim,), name="cycle_features")
-    x = normalizer(inputs)
-
-    for layer_index, units in enumerate(hidden_units):
-        x = tf.keras.layers.Dense(
-            units,
-            activation=activation,
-            name=f"encoder_dense_{layer_index + 1}",
-        )(x)
-
-    latent = tf.keras.layers.Dense(
-        latent_dim,
-        activation="linear",
-        name="latent_embedding",
-    )(x)
-
-    x = latent
-    for layer_index, units in enumerate(reversed(hidden_units)):
-        x = tf.keras.layers.Dense(
-            units,
-            activation=activation,
-            name=f"decoder_dense_{layer_index + 1}",
-        )(x)
-
-    reconstruction = tf.keras.layers.Dense(
-        input_dim,
-        activation=output_activation,
-        name="reconstruction",
-    )(x)
-
-    autoencoder = tf.keras.Model(inputs=inputs, outputs=reconstruction, name="autoencoder")
-    encoder = tf.keras.Model(inputs=inputs, outputs=latent, name="encoder")
-
-    autoencoder.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=MODEL["loss"],
-        metrics=[tf.keras.metrics.MeanSquaredError(name="mse")],
-    )
-    return autoencoder, encoder
-
-
-def write_model_summary(model: tf.keras.Model, output_path: Path) -> None:
-    """Save a text summary of a Keras model."""
-    buffer = io.StringIO()
-    model.summary(print_fn=lambda line: buffer.write(line + "\n"))
-    output_path.write_text(buffer.getvalue(), encoding="utf-8")
-
-
-def make_callbacks(training_root: Path, tensorboard_root: Path) -> list[tf.keras.callbacks.Callback]:
-    """Build the standard callback set for training."""
-    return [
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(training_root / "autoencoder.keras"),
-            monitor="val_loss",
-            save_best_only=True,
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=TRAINING["early_stopping_patience"],
-            restore_best_weights=True,
-        ),
-        tf.keras.callbacks.CSVLogger(str(training_root / "training_history.csv")),
-        tf.keras.callbacks.TensorBoard(
-            log_dir=str(tensorboard_root),
-            histogram_freq=TRAINING["tensorboard_histogram_freq"],
-        ),
+    missing_paths = [
+        path for path in [beat_features_path, learning_input_columns_path, feature_names_path] if not path.exists()
     ]
+    if missing_paths:
+        raise FileNotFoundError(f"Missing representation learning inputs: {missing_paths}")
+
+    feature_frame = pd.read_csv(beat_features_path)
+    learning_input_columns = load_json_list(learning_input_columns_path)
+    feature_names = load_json_list(feature_names_path)
+    logger.info("입력 파일 로드 완료: num_valid_beats=%s", len(feature_frame))
+    return feature_frame, learning_input_columns, feature_names
 
 
-def history_summary(history: tf.keras.callbacks.History) -> dict[str, float | int | None]:
-    """Convert Keras history into a compact numeric summary."""
-    loss_history = history.history.get("loss", [])
-    val_loss_history = history.history.get("val_loss", [])
-    return {
-        "epochs_ran": len(loss_history),
-        "best_validation_loss": float(np.min(val_loss_history)) if val_loss_history else None,
-        "final_training_loss": float(loss_history[-1]) if loss_history else None,
-        "final_validation_loss": float(val_loss_history[-1]) if val_loss_history else None,
+def validate_input_frame(
+    feature_frame: pd.DataFrame,
+    learning_input_columns: list[str],
+    feature_names: list[str],
+) -> None:
+    missing_metadata = [column for column in REQUIRED_METADATA_COLUMNS if column not in feature_frame.columns]
+    if missing_metadata:
+        raise ValueError(f"Missing required metadata columns: {missing_metadata}")
+
+    missing_learning_columns = [column for column in learning_input_columns if column not in feature_frame.columns]
+    if missing_learning_columns:
+        raise ValueError(f"Missing learning input columns in beat_features_valid.csv: {missing_learning_columns}")
+
+    unknown_learning_columns = [column for column in learning_input_columns if column not in feature_names]
+    if unknown_learning_columns:
+        raise ValueError(f"Columns in learning_input_columns.json are absent from feature_names.json: {unknown_learning_columns}")
+
+    if feature_frame["valid_flag"].isnull().any():
+        raise ValueError("valid_flag contains null values")
+
+    valid_flags = pd.to_numeric(feature_frame["valid_flag"], errors="raise").astype(np.int64)
+    if np.any(valid_flags != 1):
+        raise ValueError("beat_features_valid.csv must contain only valid beats with valid_flag = 1")
+
+    if feature_frame[learning_input_columns].isnull().any().any():
+        null_counts = feature_frame[learning_input_columns].isnull().sum()
+        failing = null_counts[null_counts > 0].to_dict()
+        raise ValueError(f"Learning input columns contain null values: {failing}")
+
+
+def allocate_split_counts(num_records: int, train_ratio: float, val_ratio: float, test_ratio: float) -> dict[str, int]:
+    if num_records < 3:
+        raise ValueError("At least three distinct record_id values are required for train/validation/test split")
+
+    ratios = {
+        "train": train_ratio,
+        "validation": val_ratio,
+        "test": test_ratio,
     }
+    raw_counts = {name: num_records * ratio for name, ratio in ratios.items()}
+    counts = {name: int(np.floor(value)) for name, value in raw_counts.items()}
+    remainder = num_records - sum(counts.values())
+
+    fractional_priority = sorted(
+        ratios.keys(),
+        key=lambda name: (raw_counts[name] - counts[name], ratios[name]),
+        reverse=True,
+    )
+    for split_name in fractional_priority[:remainder]:
+        counts[split_name] += 1
+
+    for split_name in ["validation", "test", "train"]:
+        if counts[split_name] > 0:
+            continue
+        donor = max(
+            (name for name in counts if counts[name] > 1),
+            key=lambda name: counts[name],
+            default=None,
+        )
+        if donor is None:
+            raise ValueError("Unable to allocate non-empty train/validation/test split")
+        counts[donor] -= 1
+        counts[split_name] += 1
+
+    if sum(counts.values()) != num_records:
+        raise ValueError("Split count allocation failed")
+    return counts
 
 
-def reconstruction_error_table(
-    autoencoder: tf.keras.Model,
-    normalizer: tf.keras.layers.Normalization,
-    features: np.ndarray,
-    metadata: pd.DataFrame,
-    train_mask: np.ndarray,
-    validation_mask: np.ndarray,
+def build_record_group_split(
+    feature_frame: pd.DataFrame,
+    random_seed: int,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+) -> SplitData:
+    record_ids = feature_frame["record_id"].drop_duplicates().astype(str).tolist()
+    rng = np.random.default_rng(random_seed)
+    shuffled_records = list(record_ids)
+    rng.shuffle(shuffled_records)
+
+    split_counts = allocate_split_counts(
+        num_records=len(shuffled_records),
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+    )
+    train_end = split_counts["train"]
+    val_end = train_end + split_counts["validation"]
+
+    train_records = shuffled_records[:train_end]
+    val_records = shuffled_records[train_end:val_end]
+    test_records = shuffled_records[val_end:]
+
+    train_frame = feature_frame.loc[feature_frame["record_id"].isin(train_records)].copy()
+    val_frame = feature_frame.loc[feature_frame["record_id"].isin(val_records)].copy()
+    test_frame = feature_frame.loc[feature_frame["record_id"].isin(test_records)].copy()
+
+    if train_frame.empty or val_frame.empty or test_frame.empty:
+        raise ValueError("Train/validation/test split must each contain at least one beat")
+
+    return SplitData(
+        train_frame=train_frame,
+        val_frame=val_frame,
+        test_frame=test_frame,
+        train_records=train_records,
+        val_records=val_records,
+        test_records=test_records,
+    )
+
+
+def dataframe_to_feature_matrix(frame: pd.DataFrame, feature_columns: list[str]) -> np.ndarray:
+    matrix = frame.loc[:, feature_columns].to_numpy(dtype=np.float32)
+    if matrix.ndim != 2:
+        raise ValueError("Feature matrix must be two-dimensional")
+    return matrix
+
+
+def build_tensor_loader(matrix: np.ndarray, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
+    dataset = TensorDataset(torch.from_numpy(matrix))
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, generator=generator)
+
+
+def mask_numpy_array(matrix: np.ndarray, mask_ratio: float, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    mask = rng.random(matrix.shape, dtype=np.float32) < mask_ratio
+    masked = matrix.copy()
+    masked[mask] = 0.0
+    return masked.astype(np.float32)
+
+
+def mask_tensor(inputs: torch.Tensor, mask_ratio: float) -> torch.Tensor:
+    mask = torch.rand(inputs.shape, device=inputs.device) < mask_ratio
+    return torch.where(mask, torch.zeros_like(inputs), inputs)
+
+
+def evaluate_model(
+    model: DenoisingAutoencoder,
+    criterion: nn.Module,
+    clean_matrix: np.ndarray,
+    noisy_matrix: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+) -> float:
+    model.eval()
+    dataset = TensorDataset(torch.from_numpy(noisy_matrix), torch.from_numpy(clean_matrix))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    total_loss = 0.0
+    total_count = 0
+    with torch.no_grad():
+        for noisy_batch, clean_batch in loader:
+            noisy_batch = noisy_batch.to(device=device, dtype=torch.float32)
+            clean_batch = clean_batch.to(device=device, dtype=torch.float32)
+            outputs = model(noisy_batch)
+            loss = criterion(outputs, clean_batch)
+            batch_size_current = int(clean_batch.shape[0])
+            total_loss += float(loss.item()) * batch_size_current
+            total_count += batch_size_current
+
+    if total_count == 0:
+        raise ValueError("Evaluation loader is empty")
+    return total_loss / float(total_count)
+
+
+def train_denoising_autoencoder(
+    train_matrix: np.ndarray,
+    val_matrix: np.ndarray,
+    input_dim: int,
+    training_root: Path,
+    config: TrainingConfig,
+) -> tuple[DenoisingAutoencoder, pd.DataFrame, int]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = DenoisingAutoencoder(input_dim=input_dim, latent_dim=config.LATENT_DIM).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.LEARNING_RATE,
+        weight_decay=config.WEIGHT_DECAY,
+    )
+    criterion = nn.MSELoss()
+
+    train_loader = build_tensor_loader(
+        matrix=train_matrix,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        seed=config.RANDOM_SEED,
+    )
+    val_noisy = mask_numpy_array(val_matrix, mask_ratio=config.MASK_RATIO, seed=config.RANDOM_SEED)
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+    best_state_dict: dict[str, torch.Tensor] | None = None
+    history_rows: list[dict[str, float | int]] = []
+    patience_counter = 0
+
+    for epoch in range(1, config.MAX_EPOCHS + 1):
+        model.train()
+        train_loss_sum = 0.0
+        train_count = 0
+
+        for (clean_batch,) in train_loader:
+            clean_batch = clean_batch.to(device=device, dtype=torch.float32)
+            noisy_batch = mask_tensor(clean_batch, mask_ratio=config.MASK_RATIO)
+
+            optimizer.zero_grad()
+            output_batch = model(noisy_batch)
+            loss = criterion(output_batch, clean_batch)
+            loss.backward()
+            optimizer.step()
+
+            batch_size_current = int(clean_batch.shape[0])
+            train_loss_sum += float(loss.item()) * batch_size_current
+            train_count += batch_size_current
+
+        train_loss = train_loss_sum / float(train_count)
+        val_loss = evaluate_model(
+            model=model,
+            criterion=criterion,
+            clean_matrix=val_matrix,
+            noisy_matrix=val_noisy,
+            batch_size=config.BATCH_SIZE,
+            device=device,
+        )
+        history_rows.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            }
+        )
+        logger.info("epoch=%s train_loss=%.8f val_loss=%.8f", epoch, train_loss, val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_state_dict = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            break
+
+    if best_state_dict is None or best_epoch < 0:
+        raise RuntimeError("Best model checkpoint was not created")
+
+    model.load_state_dict(best_state_dict)
+    checkpoint_path = training_root / config.MODEL_FILENAME
+    torch.save(
+        {
+            "model_state_dict": best_state_dict,
+            "input_dim": input_dim,
+            "latent_dim": config.LATENT_DIM,
+            "mask_ratio": config.MASK_RATIO,
+            "random_seed": config.RANDOM_SEED,
+        },
+        checkpoint_path,
+    )
+    logger.info("best epoch: %s", best_epoch)
+
+    history_frame = pd.DataFrame(history_rows)
+    return model, history_frame, best_epoch
+
+
+def extract_latent_dataframe(
+    model: DenoisingAutoencoder,
+    feature_frame: pd.DataFrame,
+    scaled_matrix: np.ndarray,
     batch_size: int,
 ) -> pd.DataFrame:
-    """
-    Compute per-sample reconstruction errors for all valid cycles.
+    device = next(model.parameters()).device
+    loader = DataLoader(TensorDataset(torch.from_numpy(scaled_matrix)), batch_size=batch_size, shuffle=False)
 
-    Input:
-        features: raw feature matrix with shape (num_valid_cycles, input_dim)
-        metadata: aligned valid metadata with shape (num_valid_cycles, num_columns)
-    Output:
-        DataFrame aligned 1:1 with valid cycles.
-    """
-    normalized_targets = normalizer(features).numpy().astype(np.float32)
-    predictions = autoencoder.predict(features, batch_size=batch_size, verbose=0)
+    latent_batches: list[np.ndarray] = []
+    model.eval()
+    with torch.no_grad():
+        for (batch,) in loader:
+            batch = batch.to(device=device, dtype=torch.float32)
+            latent = model.encode(batch).cpu().numpy().astype(np.float32)
+            latent_batches.append(latent)
 
-    squared_error = np.square(predictions - normalized_targets)
-    absolute_error = np.abs(predictions - normalized_targets)
-    reconstruction_mse = np.mean(squared_error, axis=1)
-    reconstruction_mae = np.mean(absolute_error, axis=1)
+    latent_matrix = np.vstack(latent_batches)
+    latent_columns = [f"latent_{index:02d}" for index in range(latent_matrix.shape[1])]
 
-    split_labels = np.where(train_mask, "train", "validation")
-    if not np.all(train_mask | validation_mask):
-        raise ValueError("Split masks do not cover every valid sample.")
-
-    output = metadata[["sample_id", "subject_id", "recording_id"]].copy()
-    if "feature_row_index" in metadata.columns:
-        output["feature_row_index"] = metadata["feature_row_index"].astype(int)
-    if "waveform_row_index" in metadata.columns:
-        output["waveform_row_index"] = metadata["waveform_row_index"].astype(int)
-    output["split"] = split_labels
-    output["reconstruction_mse"] = reconstruction_mse
-    output["reconstruction_mae"] = reconstruction_mae
-    return output
+    latent_frame = feature_frame.loc[:, ["record_id", "beat_index"]].copy()
+    for column_index, column_name in enumerate(latent_columns):
+        latent_frame[column_name] = latent_matrix[:, column_index]
+    return latent_frame
 
 
-def export_training_excel(
-    training_root: Path,
-    training_summary: dict[str, Any],
-    history: tf.keras.callbacks.History,
-    reconstruction_table: pd.DataFrame,
-) -> Path:
-    """Export training-stage artifacts to an Excel workbook."""
-    overview_rows: list[dict[str, Any]] = []
-    for key in [
-        "run_name",
-        "input_dimension",
-        "num_training_samples",
-        "num_validation_samples",
-        "latent_dimension",
-        "best_validation_loss",
-        "final_training_loss",
-        "final_validation_loss",
-        "split_column",
-        "tensorflow_version",
-    ]:
-        overview_rows.append({"section": "summary", "metric": key, "value": training_summary[key]})
-
-    for key, value in training_summary["reconstruction_error"].items():
-        overview_rows.append({"section": "reconstruction_error", "metric": key, "value": value})
-
-    for key, value in training_summary["hyperparameters"].items():
-        if isinstance(value, list):
-            value = json.dumps(value)
-        overview_rows.append({"section": "hyperparameters", "metric": key, "value": value})
-
-    history_df = pd.DataFrame(history.history)
-    history_df.insert(0, "epoch", np.arange(1, len(history_df) + 1, dtype=int))
-    train_groups_df = pd.DataFrame({"train_group": training_summary["train_groups"]})
-    validation_groups_df = pd.DataFrame({"validation_group": training_summary["validation_groups"]})
-
-    workbook_path = training_root / EXCEL["filename"]
-    return export_stage_workbook(
-        workbook_path=workbook_path,
-        sheets={
-            "Overview": pd.DataFrame(overview_rows),
-            "Training_History": history_df,
-            "Reconstruction_Error": reconstruction_table,
-            "Train_Groups": train_groups_df,
-            "Validation_Groups": validation_groups_df,
-        },
-        freeze_panes=EXCEL["freeze_panes"],
-        header_fill=EXCEL["header_fill"],
-        header_font_color=EXCEL["header_font_color"],
-        max_column_width=EXCEL["max_column_width"],
+def save_split_info(split_data: SplitData, training_root: Path, random_seed: int) -> None:
+    split_info = {
+        "train_records": split_data.train_records,
+        "validation_records": split_data.val_records,
+        "test_records": split_data.test_records,
+        "random_seed": random_seed,
+    }
+    (training_root / TrainingConfig.SPLIT_INFO_FILENAME).write_text(
+        json.dumps(split_info, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
 
 
 def main() -> None:
-    """Train the autoencoder on preprocessed cycle-level features."""
-    set_random_seed(RANDOM_SEED)
-    output_paths = ensure_output_directories(PATHS["output_root"], RUN_NAME)
+    config = TrainingConfig()
+    set_random_seed(config.RANDOM_SEED)
 
-    features, valid_metadata, feature_names = load_preprocess_outputs(
-        preprocess_root=DATA["preprocess_root"],
-        required_metadata_columns=DATA["required_metadata_columns"],
+    output_paths = ensure_output_directories(output_root=config.OUTPUT_ROOT, run_name=config.RUN_NAME)
+    training_root = output_paths["training_root"]
+
+    feature_frame, learning_input_columns, feature_names = load_representation_inputs(config.INPUT_ROOT)
+    validate_input_frame(
+        feature_frame=feature_frame,
+        learning_input_columns=learning_input_columns,
+        feature_names=feature_names,
+    )
+    logger.info("전체 valid beat 수: %s", len(feature_frame))
+
+    split_data = build_record_group_split(
+        feature_frame=feature_frame,
+        random_seed=config.RANDOM_SEED,
+        train_ratio=config.TRAIN_RATIO,
+        val_ratio=config.VAL_RATIO,
+        test_ratio=config.TEST_RATIO,
+    )
+    logger.info(
+        "train / validation / test record 수: %s / %s / %s",
+        len(split_data.train_records),
+        len(split_data.val_records),
+        len(split_data.test_records),
+    )
+    logger.info(
+        "train / validation / test beat 수: %s / %s / %s",
+        len(split_data.train_frame),
+        len(split_data.val_frame),
+        len(split_data.test_frame),
     )
 
-    train_mask, validation_mask, split_column, train_groups, validation_groups = (
-        group_train_validation_split(
-            metadata=valid_metadata,
-            validation_fraction=TRAINING["validation_fraction"],
-            random_seed=RANDOM_SEED,
-        )
-    )
+    train_matrix = dataframe_to_feature_matrix(split_data.train_frame, learning_input_columns)
+    val_matrix = dataframe_to_feature_matrix(split_data.val_frame, learning_input_columns)
+    test_matrix = dataframe_to_feature_matrix(split_data.test_frame, learning_input_columns)
+    all_valid_matrix = dataframe_to_feature_matrix(feature_frame, learning_input_columns)
+    input_dim = train_matrix.shape[1]
+    logger.info("input dimension: %s", input_dim)
 
-    x_train = features[train_mask]
-    x_validation = features[validation_mask]
-    input_dim = features.shape[1]
-    batch_size = min(TRAINING["batch_size"], x_train.shape[0])
+    scaler = RobustScaler()
+    scaler.fit(train_matrix)
+    logger.info("scaler fit 완료")
 
-    if batch_size <= 0:
-        raise ValueError("Training batch size resolved to zero.")
+    train_scaled = scaler.transform(train_matrix).astype(np.float32)
+    val_scaled = scaler.transform(val_matrix).astype(np.float32)
+    test_scaled = scaler.transform(test_matrix).astype(np.float32)
+    all_valid_scaled = scaler.transform(all_valid_matrix).astype(np.float32)
+    joblib.dump(scaler, training_root / config.SCALER_FILENAME)
 
-    normalizer = tf.keras.layers.Normalization(axis=-1, name="feature_normalization")
-    normalizer.adapt(x_train)
-
-    y_train = normalizer(x_train).numpy().astype(np.float32)
-    y_validation = normalizer(x_validation).numpy().astype(np.float32)
-
-    autoencoder, encoder = build_autoencoder(
+    model, history_frame, _best_epoch = train_denoising_autoencoder(
+        train_matrix=train_scaled,
+        val_matrix=val_scaled,
         input_dim=input_dim,
-        hidden_units=MODEL["hidden_units"],
-        latent_dim=MODEL["latent_dim"],
-        activation=MODEL["activation"],
-        output_activation=MODEL["output_activation"],
-        learning_rate=MODEL["optimizer_learning_rate"],
-        normalizer=normalizer,
+        training_root=training_root,
+        config=config,
     )
+    history_frame.to_csv(training_root / config.TRAINING_HISTORY_FILENAME, index=False)
 
-    callbacks = make_callbacks(
-        training_root=output_paths["training_root"],
-        tensorboard_root=output_paths["tensorboard_root"],
+    criterion = nn.MSELoss()
+    test_noisy = mask_numpy_array(test_scaled, mask_ratio=config.MASK_RATIO, seed=config.RANDOM_SEED)
+    test_loss = evaluate_model(
+        model=model,
+        criterion=criterion,
+        clean_matrix=test_scaled,
+        noisy_matrix=test_noisy,
+        batch_size=config.BATCH_SIZE,
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     )
+    logger.info("test reconstruction loss=%.8f", test_loss)
 
-    history = autoencoder.fit(
-        x=x_train,
-        y=y_train,
-        validation_data=(x_validation, y_validation),
-        epochs=TRAINING["epochs"],
-        batch_size=batch_size,
-        shuffle=True,
-        callbacks=callbacks,
-        verbose=TRAINING["verbose"],
+    latent_frame = extract_latent_dataframe(
+        model=model,
+        feature_frame=feature_frame,
+        scaled_matrix=all_valid_scaled,
+        batch_size=config.BATCH_SIZE,
     )
+    latent_path = training_root / config.LATENT_FILENAME
+    latent_frame.to_csv(latent_path, index=False)
 
-    autoencoder.save(output_paths["training_root"] / "autoencoder.keras")
-    encoder.save(output_paths["training_root"] / "encoder.keras")
-    write_model_summary(autoencoder, output_paths["training_root"] / "model_summary.txt")
-
-    reconstruction_table = reconstruction_error_table(
-        autoencoder=autoencoder,
-        normalizer=normalizer,
-        features=features,
-        metadata=valid_metadata,
-        train_mask=train_mask,
-        validation_mask=validation_mask,
-        batch_size=batch_size,
-    )
-    reconstruction_table.to_csv(
-        output_paths["training_root"] / "reconstruction_error_summary.csv",
-        index=False,
-    )
-
-    compact_history = history_summary(history)
-    train_mean_mse = float(
-        reconstruction_table.loc[
-            reconstruction_table["split"] == "train", "reconstruction_mse"
-        ].mean()
-    )
-    validation_mean_mse = float(
-        reconstruction_table.loc[
-            reconstruction_table["split"] == "validation", "reconstruction_mse"
-        ].mean()
-    )
-    training_summary = {
-        "run_name": RUN_NAME,
-        "input_dimension": input_dim,
-        "num_training_samples": int(x_train.shape[0]),
-        "num_validation_samples": int(x_validation.shape[0]),
-        "latent_dimension": MODEL["latent_dim"],
-        "best_validation_loss": compact_history["best_validation_loss"],
-        "final_training_loss": compact_history["final_training_loss"],
-        "final_validation_loss": compact_history["final_validation_loss"],
-        "feature_names_count": len(feature_names),
-        "split_column": split_column,
-        "train_groups": train_groups,
-        "validation_groups": validation_groups,
-        "tensorflow_version": tf.__version__,
-        "hyperparameters": {
-            "hidden_units": MODEL["hidden_units"],
-            "activation": MODEL["activation"],
-            "output_activation": MODEL["output_activation"],
-            "loss": MODEL["loss"],
-            "optimizer_learning_rate": MODEL["optimizer_learning_rate"],
-            "validation_fraction": TRAINING["validation_fraction"],
-            "batch_size": batch_size,
-            "epochs": TRAINING["epochs"],
-            "early_stopping_patience": TRAINING["early_stopping_patience"],
-        },
-        "history_summary": compact_history,
-        "reconstruction_error": {
-            "train_mean_mse": train_mean_mse,
-            "validation_mean_mse": validation_mean_mse,
-        },
-    }
-
-    with open(
-        output_paths["training_root"] / "training_summary.json",
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(training_summary, file, indent=2)
-
-    excel_path = None
-    if EXCEL["export_enabled"]:
-        excel_path = export_training_excel(
-            training_root=output_paths["training_root"],
-            training_summary=training_summary,
-            history=history,
-            reconstruction_table=reconstruction_table,
-        )
-
-    logger.info("Saved training outputs to: %s", output_paths["training_root"])
-    if excel_path is not None:
-        logger.info("Saved training Excel export to: %s", excel_path)
-    logger.info("Input dimension: %s", input_dim)
-    logger.info("Training samples: %s", x_train.shape[0])
-    logger.info("Validation samples: %s", x_validation.shape[0])
-    logger.info("Best validation loss: %s", compact_history["best_validation_loss"])
+    save_split_info(split_data=split_data, training_root=training_root, random_seed=config.RANDOM_SEED)
+    logger.info("latent export 경로: %s", latent_path)
 
 
 if __name__ == "__main__":

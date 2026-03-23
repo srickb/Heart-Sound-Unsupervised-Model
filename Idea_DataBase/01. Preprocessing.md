@@ -1,0 +1,522 @@
+# Unsupervised Beat-Level Preprocessing Design
+
+이 문서는 본 프로젝트의 비지도학습 파이프라인 중 **전처리 및 feature engineering 구조**를 고정하기 위한 설계 문서다.
+
+이 문서의 범위는 아래까지로 제한한다.
+
+- raw filtered PCG와 beat boundary를 입력으로 받는다
+- beat validity를 판정한다
+- beat-level feature를 계산한다
+- 학습용 입력 테이블을 만든다
+- export 구조를 고정한다
+
+이 문서는 전처리 설계를 명확하게 고정하기 위한 문서이며,
+표현학습, clustering, interpretation의 다음 단계는 이 문서 범위에 포함하지 않는다.
+
+---
+
+# 1. 전처리 목표
+
+전처리의 목표는 **각 beat를 하나의 해석 가능한 feature vector로 변환하는 것**이다.
+
+즉,
+
+- 입력은 filtered PCG signal과 beat boundary
+- 출력은 beat마다 한 row를 갖는 feature table
+
+이다.
+
+각 row는 해당 beat의 시간 구조, 진폭/에너지 구조, envelope 기반 형태, 통계적 복잡도, 템플릿 유사도를 수치로 표현해야 한다.
+
+전처리 결과는 이후 비지도학습 모델의 입력으로 직접 사용된다.
+
+---
+
+# 2. 입력 정의
+
+전처리 입력은 아래로 고정한다.
+
+- filtered PCG signal: `x`
+  - 1D numpy array
+- sampling rate: `fs`
+- beat boundary
+  - `s1_on`
+  - `s1_off`
+  - `s2_on`
+  - `s2_off`
+  - `s1_on_next`
+- 선택적으로
+  - `s2_on_next`
+
+모든 boundary는 sample index 기준의 정수다.
+
+---
+
+# 3. beat validity 규칙
+
+각 beat는 아래 조건을 만족할 때 valid로 처리한다.
+
+- `0 <= s1_on < s1_off <= s2_on < s2_off < s1_on_next <= len(x)`
+
+추가로 `cycle_length_ms > 0` 이어야 한다.
+
+`cycle_length_S2_anchor_ms` 계산이 필요한 경우에는 아래 조건을 추가로 만족해야 한다.
+
+- `s2_off < s2_on_next <= len(x)`
+
+위 조건을 만족하지 않으면 해당 beat는 invalid로 처리한다.
+
+invalid beat 처리 방식은 아래로 고정한다.
+
+- feature row는 생성한다
+- 모든 feature는 `NaN`으로 저장한다
+- `valid_flag = 0`
+- valid beat는 `valid_flag = 1`
+
+학습용 입력 테이블에는 valid beat만 포함한다.
+
+---
+
+# 4. 단위 규칙
+
+모든 feature는 아래 단위를 따른다.
+
+- 시간 관련 값: `ms`
+- 비율 값: `unitless`
+- heart rate: `bpm`
+- amplitude / energy: 입력 `x`의 원래 스케일 유지
+- 추가 normalization은 feature 저장값에 적용하지 않는다
+
+단, template correlation 계산 시에는 파형 shape 비교를 위해 z-score normalization을 사용한다.
+
+---
+
+# 5. 구간 정의
+
+각 beat의 feature 계산 구간은 아래로 고정한다.
+
+- `S1 segment = x[s1_on:s1_off]`
+- `S2 segment = x[s2_on:s2_off]`
+- `systolic gap = x[s1_off:s2_on]`
+- `diastolic gap = x[s2_off:s1_on_next]`
+- `cycle = x[s1_on:s1_on_next]`
+
+S2 anchor 기반 cycle이 필요한 경우에는 아래 구간을 사용한다.
+
+- `S2 anchor cycle = x[s2_on:s2_on_next]`
+
+시간 변환은 아래 함수를 사용한다.
+
+- `samples_to_ms(n) = 1000.0 * n / fs`
+
+---
+
+# 6. envelope 정의
+
+Shape feature 계산을 위한 envelope는 아래 방식으로 정의한다.
+
+1. 전체 filtered signal `x`에 대해 Hilbert envelope 계산
+   - `e_raw = abs(hilbert(x))`
+
+2. smoothing 적용
+   - moving average 사용
+   - window size = `round(0.01 * fs)`
+   - 최소 3 sample 보장
+
+3. 결과를 `e`로 정의한다
+
+Shape 계열 feature는 raw signal peak가 아니라 **envelope peak 기준**으로 계산한다.
+
+---
+
+# 7. feature group 구조
+
+beat-level feature는 아래 다섯 개 group으로 고정한다.
+
+1. Time_Timing
+2. Amplitude_Energy
+3. Shape
+4. Statistics_Complexity
+5. Stability
+
+모든 feature column은 prefix를 강제한다.
+
+- `time_`
+- `amp_`
+- `shape_`
+- `stat_`
+- `stab_`
+
+---
+
+# 8. Time_Timing feature 정의
+
+각 valid beat마다 아래 feature를 계산한다.
+
+## 8.1 기본 시간 feature
+
+- `time_s1_duration_ms`
+  - `1000 * (s1_off - s1_on) / fs`
+
+- `time_s2_duration_ms`
+  - `1000 * (s2_off - s2_on) / fs`
+
+- `time_s1_center_time_ms`
+  - `1000 * (s1_on + s1_off) / (2 * fs)`
+  - recording 시작점 기준 absolute time
+  - 저장은 하되 학습 입력에서는 제외한다
+
+- `time_s2_center_time_ms`
+  - `1000 * (s2_on + s2_off) / (2 * fs)`
+  - recording 시작점 기준 absolute time
+  - 저장은 하되 학습 입력에서는 제외한다
+
+- `time_s1_on_to_s2_on_ms`
+  - `1000 * (s2_on - s1_on) / fs`
+
+- `time_s1_off_to_s2_on_ms`
+  - `1000 * (s2_on - s1_off) / fs`
+
+- `time_s2_on_to_next_s1_on_ms`
+  - `1000 * (s1_on_next - s2_on) / fs`
+
+- `time_s2_off_to_next_s1_on_ms`
+  - `1000 * (s1_on_next - s2_off) / fs`
+
+- `time_cycle_length_ms`
+  - `1000 * (s1_on_next - s1_on) / fs`
+
+- `time_cycle_length_s2_anchor_ms`
+  - `1000 * (s2_on_next - s2_on) / fs`
+  - `s2_on_next`가 없으면 `NaN`
+
+- `time_heart_rate_bpm`
+  - `60000.0 / cycle_length_ms`
+  - `cycle_length_ms <= 0`이면 `NaN`
+
+## 8.2 fraction / ratio feature
+
+- `time_systolic_fraction`
+  - `(s2_on - s1_on) / (s1_on_next - s1_on)`
+
+- `time_diastolic_fraction`
+  - `(s1_on_next - s2_on) / (s1_on_next - s1_on)`
+
+- `time_s1_fraction`
+  - `(s1_off - s1_on) / (s1_on_next - s1_on)`
+
+- `time_s2_fraction`
+  - `(s2_off - s2_on) / (s1_on_next - s1_on)`
+
+- `time_s1_s2_duration_ratio`
+  - `(s1_off - s1_on) / (s2_off - s2_on)`
+  - denominator <= 0 이면 `NaN`
+
+- `time_sys_dia_ratio`
+  - `(s2_on - s1_on) / (s1_on_next - s2_on)`
+  - denominator <= 0 이면 `NaN`
+
+## 8.3 center interval
+
+- `time_center_to_center_interval_ms`
+  - `cS1 = (s1_on + s1_off) / 2`
+  - `cS2 = (s2_on + s2_off) / 2`
+  - `1000 * (cS2 - cS1) / fs`
+
+---
+
+# 9. record-level timing summary 정의
+
+record-level timing summary는 beat-level 입력에 포함하지 않는다.
+
+아래 feature들에 대해 valid beat만 사용하여 summary를 계산한다.
+
+- `time_s1_duration_ms`
+- `time_s2_duration_ms`
+- `time_s1_off_to_s2_on_ms`
+- `time_s2_off_to_next_s1_on_ms`
+- `time_cycle_length_ms`
+- `time_heart_rate_bpm`
+- `time_sys_dia_ratio`
+
+각 항목에 대해 아래 값을 저장한다.
+
+- `mean`
+- `std`
+- `cv = std / (mean + eps)`
+- `rmssd = sqrt(mean(diff(feature)^2))`
+
+이 summary는 `record_summary`로 별도 저장한다.
+
+---
+
+# 10. Amplitude_Energy feature 정의
+
+Amplitude_Energy feature는 raw filtered PCG segment를 사용한다.
+
+각 beat에서 아래 구간을 정의한다.
+
+- `seg_s1 = x[s1_on:s1_off]`
+- `seg_s2 = x[s2_on:s2_off]`
+
+envelope 구간은 아래로 정의한다.
+
+- `env_s1 = e[s1_on:s1_off]`
+- `env_s2 = e[s2_on:s2_off]`
+
+각 S1, S2에 대해 아래 feature를 계산한다.
+
+## 10.1 amplitude / energy feature
+
+- `amp_s1_peak_abs`, `amp_s2_peak_abs`
+  - `max(abs(seg))`
+
+- `amp_s1_ptp`, `amp_s2_ptp`
+  - `max(seg) - min(seg)`
+
+- `amp_s1_mean_abs`, `amp_s2_mean_abs`
+  - `mean(abs(seg))`
+
+- `amp_s1_rms`, `amp_s2_rms`
+  - `sqrt(mean(seg^2))`
+
+- `amp_s1_area_abs`, `amp_s2_area_abs`
+  - `sum(abs(seg))`
+
+- `amp_s1_energy`, `amp_s2_energy`
+  - `sum(seg^2)`
+
+- `amp_s1_log_energy`, `amp_s2_log_energy`
+  - `log(energy + eps)`
+
+- `amp_s1_energy_per_ms`, `amp_s2_energy_per_ms`
+  - `energy / (duration_ms + eps)`
+
+## 10.2 comparative amplitude feature
+
+- `amp_s1_s2_peak_ratio`
+  - `amp_s1_peak_abs / (amp_s2_peak_abs + eps)`
+
+- `amp_s1_s2_energy_ratio`
+  - `amp_s1_energy / (amp_s2_energy + eps)`
+
+---
+
+# 11. Shape feature 정의
+
+Shape feature는 raw peak가 아니라 **envelope peak 기준**으로 계산한다.
+
+각 segment에서 아래를 정의한다.
+
+- `peak_idx_rel = argmax(env_seg)`
+- `peak_idx_abs = on + peak_idx_rel`
+
+각 S1, S2에 대해 아래 feature를 계산한다.
+
+## 11.1 attack / decay 구조
+
+- `shape_s1_attack_time_ms`, `shape_s2_attack_time_ms`
+  - `1000 * peak_idx_rel / fs`
+
+- `shape_s1_decay_time_ms`, `shape_s2_decay_time_ms`
+  - `1000 * (len(env_seg) - peak_idx_rel) / fs`
+
+- `shape_s1_attack_decay_ratio`, `shape_s2_attack_decay_ratio`
+  - `attack_time_ms / (decay_time_ms + eps)`
+
+## 11.2 slope 구조
+
+- `shape_s1_max_rise_slope`, `shape_s2_max_rise_slope`
+  - `max(diff(env_seg)) * fs`
+  - 단위: amplitude / sec
+  - `len(env_seg) < 2` 이면 `NaN`
+
+- `shape_s1_max_fall_slope`, `shape_s2_max_fall_slope`
+  - `min(diff(env_seg)) * fs`
+  - 단위: amplitude / sec
+  - `len(env_seg) < 2` 이면 `NaN`
+
+## 11.3 temporal centroid
+
+- `shape_s1_temporal_centroid_ms`, `shape_s2_temporal_centroid_ms`
+  - `t_rel = arange(len(env_seg)) / fs`
+  - `1000 * sum(t_rel * env_seg) / (sum(env_seg) + eps)`
+
+---
+
+# 12. Statistics_Complexity feature 정의
+
+각 S1, S2에 대해 아래 feature를 계산한다.
+
+## 12.1 skewness / kurtosis
+
+- `stat_s1_skewness`, `stat_s2_skewness`
+  - `mean(((seg - mu) / (sigma + eps))^3)`
+
+- `stat_s1_kurtosis`, `stat_s2_kurtosis`
+  - `mean(((seg - mu) / (sigma + eps))^4)`
+  - excess kurtosis가 아니라 raw kurtosis 사용
+
+## 12.2 zero crossing rate
+
+- `stat_s1_zero_crossing_rate`, `stat_s2_zero_crossing_rate`
+  - `sign_changes / (len(seg) - 1)`
+  - `len(seg) < 2` 이면 `NaN`
+
+## 12.3 first difference complexity
+
+- `stat_s1_abs_sum_first_diff`, `stat_s2_abs_sum_first_diff`
+  - `sum(abs(diff(seg)))`
+  - `len(seg) < 2` 이면 `NaN`
+
+---
+
+# 13. Stability feature 정의
+
+Stability feature는 해당 beat의 S1/S2 파형이 recording 내부 대표 파형과 얼마나 유사한지 나타낸다.
+
+## 13.1 template 생성 방식
+
+S1과 S2는 각각 별도 template를 만든다.
+
+### S1
+1. valid한 모든 S1 segment를 길이 `L = 128`로 선형 보간 resample
+2. 각 segment를 z-score normalize
+3. std가 매우 작으면 0 vector 처리
+4. point-wise median으로 `template_s1` 생성
+
+### S2
+동일한 방식으로 `template_s2` 생성
+
+## 13.2 beat별 template similarity
+
+각 beat에 대해 아래 feature를 계산한다.
+
+- `stab_s1_template_corr`
+- `stab_s2_template_corr`
+
+계산은 normalized segment와 template 간 Pearson correlation으로 수행한다.
+
+---
+
+# 14. metadata column 정의
+
+모든 beat row에는 feature 외에 아래 metadata를 포함한다.
+
+- `record_id`
+- `beat_index`
+- `valid_flag`
+- `s1_on`
+- `s1_off`
+- `s2_on`
+- `s2_off`
+- `s1_on_next`
+- `s2_on_next` 가능 시 포함
+
+absolute boundary index는 metadata로 저장하고,
+학습 입력 feature에는 포함하지 않는다.
+
+---
+
+# 15. 학습 입력 column 구성 규칙
+
+학습 입력 테이블은 아래 규칙으로 구성한다.
+
+## 포함
+- valid beat만 사용
+- beat-level feature만 포함
+- time / amp / shape / stat / stab feature 포함
+
+## 제외
+- `valid_flag`
+- boundary index metadata
+- `record_id`
+- `beat_index`
+- `time_s1_center_time_ms`
+- `time_s2_center_time_ms`
+- record-level summary column
+
+즉, 학습 입력은 beat morphology와 timing 구조를 나타내는 feature만 남긴다.
+
+---
+
+# 16. scaling 규칙
+
+feature 저장값은 원 단위를 유지한다.
+
+모델 입력을 만들 때는 valid beat에 대해 아래 절차를 수행한다.
+
+1. 학습 입력 column 선택
+2. train split 기준으로 scaler fit
+3. 전체 train/validation/test에 동일 scaler 적용
+4. scaler 저장
+
+기본 scaler는 `RobustScaler`로 고정한다.
+
+---
+
+# 17. export 구조
+
+전처리 출력은 아래 파일 구조로 저장한다.
+
+## 17.1 beat-level 전체 feature table
+- 모든 beat row 포함
+- invalid beat 포함
+- 파일명 예: `beat_features_all.csv`
+
+## 17.2 valid beat feature table
+- `valid_flag = 1`인 row만 포함
+- 파일명 예: `beat_features_valid.csv`
+
+## 17.3 learning input column list
+- 실제 학습 입력에 사용되는 column 목록
+- 파일명 예: `learning_input_columns.json`
+
+## 17.4 feature name list
+- 전체 feature 이름 목록
+- 파일명 예: `feature_names.json`
+
+## 17.5 record summary
+- timing variability summary 저장
+- 파일명 예: `record_summary.csv`
+
+## 17.6 Excel export
+아래 시트를 포함한다.
+
+- `beat_features_all`
+- `beat_features_valid`
+- `record_summary`
+
+---
+
+# 18. 전처리 구현 순서
+
+전처리는 반드시 아래 순서로 구현한다.
+
+1. recording 로드
+2. boundary 로드
+3. beat loop 수행
+4. validity 판정
+5. valid beat에 대해 feature group별 계산
+6. feature row 생성
+7. 전체 row를 DataFrame으로 결합
+8. valid row subset 생성
+9. record-level summary 생성
+10. export 수행
+
+이 순서를 유지한다.
+
+---
+
+# 19. 전처리 결과 상태 정의
+
+전처리가 완료되면 아래가 만족되어야 한다.
+
+- 각 beat가 하나의 row로 저장된다
+- invalid beat는 NaN feature + `valid_flag = 0`으로 남아 있다
+- valid beat만 모은 학습 입력용 table이 존재한다
+- feature 이름만 봐도 group과 의미를 알 수 있다
+- 학습 입력에서 absolute time과 metadata가 제외되어 있다
+- record-level summary가 별도로 저장되어 있다
+
+이 상태를 전처리 완료 상태로 정의한다.
