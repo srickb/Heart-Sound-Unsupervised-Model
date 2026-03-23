@@ -44,11 +44,12 @@ import matplotlib.pyplot as plt
 
 class InterpretationConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
-    INPUT_ROOT = PROJECT_ROOT / "outputs" / "cluster_training_fixed" / "clustering"
-    PREPROCESS_INPUT_ROOT = PROJECT_ROOT / "outputs" / "beat_level_preprocess_fixed" / "preprocess"
-    DATA_ROOT = PROJECT_ROOT / "Data" / "Test_Dataset_260312"
-    OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-    RUN_NAME = "cluster_interpretation_fixed"
+
+    # 아래 4개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
+    PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
+    CLUSTERING_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\clustering"
+    TRAIN_DATA_FOLDER = r"C:\Users\LUI\Desktop\PCG\Data\Train 학습데이터(260109)"
+    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\interpretation"
     RANDOM_SEED = 42
     NUM_CLUSTERS = 4
     TOP_FEATURES_PER_CLUSTER = 10
@@ -92,22 +93,18 @@ logger = logging.getLogger(__name__)
 FEATURE_GROUP_PREFIXES = ["time_", "amp_", "shape_", "stat_", "stab_"]
 
 
-def ensure_output_directories(output_root: Path, run_name: str) -> dict[str, Path]:
-    run_root = output_root / run_name
-    preprocess_root = run_root / "preprocess"
-    training_root = run_root / "training"
-    clustering_root = run_root / "clustering"
-    interpretation_root = run_root / "interpretation"
+def configured_path(path_value: Path | str) -> Path:
+    return Path(path_value).expanduser()
+
+
+def ensure_output_directories(stage_output_folder: Path) -> dict[str, Path]:
+    interpretation_root = stage_output_folder
     figures_root = interpretation_root / "figures"
 
-    for path in [preprocess_root, training_root, clustering_root, interpretation_root, figures_root]:
+    for path in [interpretation_root, figures_root]:
         path.mkdir(parents=True, exist_ok=True)
 
     return {
-        "run_root": run_root,
-        "preprocess_root": preprocess_root,
-        "training_root": training_root,
-        "clustering_root": clustering_root,
         "interpretation_root": interpretation_root,
         "figures_root": figures_root,
     }
@@ -682,13 +679,21 @@ def save_outputs(
 
 def main() -> None:
     config = InterpretationConfig()
-    output_paths = ensure_output_directories(output_root=config.OUTPUT_ROOT, run_name=config.RUN_NAME)
+    output_paths = ensure_output_directories(stage_output_folder=configured_path(config.OUTPUT_FOLDER))
     interpretation_root = output_paths["interpretation_root"]
     figures_root = output_paths["figures_root"]
+    preprocess_input_root = configured_path(config.PREPROCESS_INPUT_FOLDER)
+    clustering_input_root = configured_path(config.CLUSTERING_INPUT_FOLDER)
+    train_data_root = configured_path(config.TRAIN_DATA_FOLDER)
+
+    logger.info("전처리 입력 폴더: %s", preprocess_input_root)
+    logger.info("클러스터링 입력 폴더: %s", clustering_input_root)
+    logger.info("원본 데이터 폴더: %s", train_data_root)
+    logger.info("해석 출력 폴더: %s", interpretation_root)
 
     inputs = load_interpretation_inputs(
-        preprocess_root=config.PREPROCESS_INPUT_ROOT,
-        clustering_root=config.INPUT_ROOT,
+        preprocess_root=preprocess_input_root,
+        clustering_root=clustering_input_root,
     )
     validate_inputs(inputs)
 
@@ -727,7 +732,7 @@ def main() -> None:
     )
     export_representative_figures(
         representative_beats=representative_beats,
-        data_root=config.DATA_ROOT,
+        data_root=train_data_root,
         figures_root=figures_root,
         fs=config.SAMPLING_RATE,
         smooth_ms=config.ENVELOPE_SMOOTH_MS,

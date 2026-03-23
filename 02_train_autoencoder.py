@@ -32,9 +32,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 class TrainingConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
-    INPUT_ROOT = PROJECT_ROOT / "outputs" / "beat_level_preprocess_fixed" / "preprocess"
-    OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-    RUN_NAME = "representation_learning_fixed"
+
+    # 아래 2개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
+    PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
+    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\training"
     RANDOM_SEED = 42
     LATENT_DIM = 12
     BATCH_SIZE = 256
@@ -115,23 +116,14 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def ensure_output_directories(output_root: Path, run_name: str) -> dict[str, Path]:
-    run_root = output_root / run_name
-    preprocess_root = run_root / "preprocess"
-    training_root = run_root / "training"
-    clustering_root = run_root / "clustering"
-    interpretation_root = run_root / "interpretation"
+def configured_path(path_value: Path | str) -> Path:
+    return Path(path_value).expanduser()
 
-    for path in [preprocess_root, training_root, clustering_root, interpretation_root]:
-        path.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "run_root": run_root,
-        "preprocess_root": preprocess_root,
-        "training_root": training_root,
-        "clustering_root": clustering_root,
-        "interpretation_root": interpretation_root,
-    }
+def ensure_output_directories(stage_output_folder: Path) -> dict[str, Path]:
+    training_root = stage_output_folder
+    training_root.mkdir(parents=True, exist_ok=True)
+    return {"training_root": training_root}
 
 
 def load_json_list(file_path: Path) -> list[str]:
@@ -472,10 +464,14 @@ def main() -> None:
     config = TrainingConfig()
     set_random_seed(config.RANDOM_SEED)
 
-    output_paths = ensure_output_directories(output_root=config.OUTPUT_ROOT, run_name=config.RUN_NAME)
+    output_paths = ensure_output_directories(stage_output_folder=configured_path(config.OUTPUT_FOLDER))
     training_root = output_paths["training_root"]
 
-    feature_frame, learning_input_columns, feature_names = load_representation_inputs(config.INPUT_ROOT)
+    preprocess_input_root = configured_path(config.PREPROCESS_INPUT_FOLDER)
+    logger.info("전처리 입력 폴더: %s", preprocess_input_root)
+    logger.info("학습 출력 폴더: %s", training_root)
+
+    feature_frame, learning_input_columns, feature_names = load_representation_inputs(preprocess_input_root)
     validate_input_frame(
         feature_frame=feature_frame,
         learning_input_columns=learning_input_columns,

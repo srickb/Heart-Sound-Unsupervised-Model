@@ -39,9 +39,10 @@ matplotlib.use("Agg")
 
 class PreprocessConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
-    DATA_ROOT = PROJECT_ROOT / "Data" / "Test_Dataset_260312"
-    OUTPUT_ROOT = PROJECT_ROOT / "outputs"
-    RUN_NAME = "beat_level_preprocess_fixed"
+
+    # 아래 2개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
+    TRAIN_DATA_FOLDER = r"C:\Users\LUI\Desktop\PCG\Data\Train 학습데이터(260109)"
+    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
 
     FILE_GLOB = "*"
     SUPPORTED_INPUT_SUFFIXES = (".xlsx", ".csv")
@@ -198,23 +199,14 @@ def parse_record_id(file_path: Path) -> str:
     return file_path.stem
 
 
-def ensure_output_directories(output_root: Path, run_name: str) -> dict[str, Path]:
-    run_root = output_root / run_name
-    preprocess_root = run_root / "preprocess"
-    training_root = run_root / "training"
-    clustering_root = run_root / "clustering"
-    interpretation_root = run_root / "interpretation"
+def configured_path(path_value: Path | str) -> Path:
+    return Path(path_value).expanduser()
 
-    for path in [preprocess_root, training_root, clustering_root, interpretation_root]:
-        path.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "run_root": run_root,
-        "preprocess_root": preprocess_root,
-        "training_root": training_root,
-        "clustering_root": clustering_root,
-        "interpretation_root": interpretation_root,
-    }
+def ensure_output_directories(stage_output_folder: Path) -> dict[str, Path]:
+    preprocess_root = stage_output_folder
+    preprocess_root.mkdir(parents=True, exist_ok=True)
+    return {"preprocess_root": preprocess_root}
 
 
 def normalize_column_name(column_name: Any) -> str:
@@ -1056,13 +1048,15 @@ def collect_input_files(data_root: Path, file_glob: str, supported_suffixes: tup
 
 def main() -> None:
     output_paths = ensure_output_directories(
-        output_root=PreprocessConfig.OUTPUT_ROOT,
-        run_name=PreprocessConfig.RUN_NAME,
+        stage_output_folder=configured_path(PreprocessConfig.OUTPUT_FOLDER),
     )
 
-    data_root = PreprocessConfig.DATA_ROOT
+    data_root = configured_path(PreprocessConfig.TRAIN_DATA_FOLDER)
     if not data_root.exists():
         raise FileNotFoundError(f"Data root does not exist: {data_root}")
+
+    logger.info("입력 데이터 폴더: %s", data_root)
+    logger.info("전처리 출력 폴더: %s", output_paths["preprocess_root"])
 
     file_paths = collect_input_files(
         data_root=data_root,
