@@ -1,16 +1,17 @@
 """
-Cluster interpretation script fixed to the current unsupervised design.
+Cluster interpretation script for the revised Heart-Sound-Unsupervised-Model pipeline.
 
 Expected input files:
-- outputs/beat_level_preprocess_fixed/preprocess/beat_features_valid.csv
-- outputs/beat_level_preprocess_fixed/preprocess/learning_input_columns.json
-- outputs/beat_level_preprocess_fixed/preprocess/feature_names.json
-- outputs/cluster_training_fixed/clustering/cluster_assignments_valid.csv
-- outputs/cluster_training_fixed/clustering/cluster_centers.npy
-
-Optional input files:
-- outputs/beat_level_preprocess_fixed/preprocess/beat_features_all.csv
-- outputs/beat_level_preprocess_fixed/preprocess/record_summary.csv
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/beat_features_valid.csv
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/learning_input_columns.json
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/feature_names.json
+- outputs/{PREPROCESS_RUN_NAME}/preprocess/feature_groups.json
+- outputs/{CLUSTERING_RUN_NAME}/clustering/hdbscan_labels_train.csv
+- outputs/{CLUSTERING_RUN_NAME}/clustering/all_valid_with_latent.csv
+- outputs/{CLUSTERING_RUN_NAME}/clustering/clustering_summary.json
+- outputs/{CLUSTERING_RUN_NAME}/clustering/cluster_exemplars.csv
+- outputs/{CLUSTERING_RUN_NAME}/clustering/cluster_stability_summary.csv
+- outputs/{CLUSTERING_RUN_NAME}/clustering/record_distribution_summary.csv
 
 Saved artifacts:
 - outputs/{RUN_NAME}/interpretation/cluster_overview.csv
@@ -31,39 +32,43 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import matplotlib
 import numpy as np
 import pandas as pd
-from scipy.signal import hilbert
 
 from excel_export_utils import export_stage_workbook
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 
 class InterpretationConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
 
-    # 아래 4개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
+    # 아래 3개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
     PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
     CLUSTERING_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\clustering"
     TRAIN_DATA_FOLDER = r"C:\Users\LUI\Desktop\PCG\Data\Train 학습데이터(260109)"
     OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\interpretation"
-    RANDOM_SEED = 42
-    NUM_CLUSTERS = 4
+
     TOP_FEATURES_PER_CLUSTER = 10
     REPRESENTATIVE_BEATS_PER_CLUSTER = 5
-    UMAP_N_NEIGHBORS = 15
-    UMAP_MIN_DIST = 0.1
+    ENVELOPE_SMOOTH_MS = 20.0
+    SAMPLING_RATE = 4000.0
+    EPS = 1e-8
+    CSV_ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
 
     BEAT_FEATURES_VALID_FILENAME = "beat_features_valid.csv"
     LEARNING_INPUT_COLUMNS_FILENAME = "learning_input_columns.json"
     FEATURE_NAMES_FILENAME = "feature_names.json"
-    BEAT_FEATURES_ALL_FILENAME = "beat_features_all.csv"
-    RECORD_SUMMARY_FILENAME = "record_summary.csv"
-    ASSIGNMENTS_FILENAME = "cluster_assignments_valid.csv"
-    CLUSTER_CENTERS_FILENAME = "cluster_centers.npy"
+    FEATURE_GROUPS_FILENAME = "feature_groups.json"
+
+    HDBSCAN_LABELS_TRAIN_FILENAME = "hdbscan_labels_train.csv"
+    ALL_VALID_WITH_LATENT_FILENAME = "all_valid_with_latent.csv"
+    CLUSTERING_SUMMARY_FILENAME = "clustering_summary.json"
+    CLUSTER_EXEMPLARS_FILENAME = "cluster_exemplars.csv"
+    CLUSTER_STABILITY_SUMMARY_FILENAME = "cluster_stability_summary.csv"
+    RECORD_DISTRIBUTION_SUMMARY_FILENAME = "record_distribution_summary.csv"
 
     CLUSTER_OVERVIEW_FILENAME = "cluster_overview.csv"
     FEATURE_SUMMARY_FILENAME = "feature_summary_by_cluster.csv"
@@ -80,17 +85,10 @@ class InterpretationConfig:
     EXCEL_HEADER_FONT_COLOR = "FFFFFF"
     EXCEL_MAX_COLUMN_WIDTH = 40
 
-    SAMPLING_RATE = 4000
-    ENVELOPE_SMOOTH_MS = 10.0
-    CSV_ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
-    EPS = 1e-12
 
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-
-FEATURE_GROUP_PREFIXES = ["time_", "amp_", "shape_", "stat_", "stab_"]
+# =================================================
+# 1. IO Helpers
+# =================================================
 
 
 def configured_path(path_value: Path | str) -> Path:
@@ -100,10 +98,8 @@ def configured_path(path_value: Path | str) -> Path:
 def ensure_output_directories(stage_output_folder: Path) -> dict[str, Path]:
     interpretation_root = stage_output_folder
     figures_root = interpretation_root / "figures"
-
-    for path in [interpretation_root, figures_root]:
-        path.mkdir(parents=True, exist_ok=True)
-
+    interpretation_root.mkdir(parents=True, exist_ok=True)
+    figures_root.mkdir(parents=True, exist_ok=True)
     return {
         "interpretation_root": interpretation_root,
         "figures_root": figures_root,
@@ -117,6 +113,13 @@ def load_json_list(file_path: Path) -> list[str]:
     return values
 
 
+def load_json_dict(file_path: Path) -> dict[str, Any]:
+    values = json.loads(file_path.read_text(encoding="utf-8"))
+    if not isinstance(values, dict):
+        raise ValueError(f"Expected JSON object: {file_path}")
+    return values
+
+
 def load_optional_csv(file_path: Path) -> pd.DataFrame | None:
     if not file_path.exists():
         return None
@@ -127,47 +130,50 @@ def load_interpretation_inputs(
     preprocess_root: Path,
     clustering_root: Path,
 ) -> dict[str, Any]:
-    beat_features_valid_path = preprocess_root / InterpretationConfig.BEAT_FEATURES_VALID_FILENAME
-    learning_input_columns_path = preprocess_root / InterpretationConfig.LEARNING_INPUT_COLUMNS_FILENAME
-    feature_names_path = preprocess_root / InterpretationConfig.FEATURE_NAMES_FILENAME
-    assignments_path = clustering_root / InterpretationConfig.ASSIGNMENTS_FILENAME
-    cluster_centers_path = clustering_root / InterpretationConfig.CLUSTER_CENTERS_FILENAME
-
-    missing_paths = [
-        path
-        for path in [
-            beat_features_valid_path,
-            learning_input_columns_path,
-            feature_names_path,
-            assignments_path,
-            cluster_centers_path,
-        ]
-        if not path.exists()
-    ]
+    required_paths = {
+        "beat_features_valid": preprocess_root / InterpretationConfig.BEAT_FEATURES_VALID_FILENAME,
+        "learning_input_columns": preprocess_root / InterpretationConfig.LEARNING_INPUT_COLUMNS_FILENAME,
+        "feature_names": preprocess_root / InterpretationConfig.FEATURE_NAMES_FILENAME,
+        "feature_groups": preprocess_root / InterpretationConfig.FEATURE_GROUPS_FILENAME,
+        "hdbscan_labels_train": clustering_root / InterpretationConfig.HDBSCAN_LABELS_TRAIN_FILENAME,
+        "all_valid_with_latent": clustering_root / InterpretationConfig.ALL_VALID_WITH_LATENT_FILENAME,
+        "clustering_summary": clustering_root / InterpretationConfig.CLUSTERING_SUMMARY_FILENAME,
+        "cluster_exemplars": clustering_root / InterpretationConfig.CLUSTER_EXEMPLARS_FILENAME,
+        "cluster_stability_summary": clustering_root / InterpretationConfig.CLUSTER_STABILITY_SUMMARY_FILENAME,
+        "record_distribution_summary": clustering_root / InterpretationConfig.RECORD_DISTRIBUTION_SUMMARY_FILENAME,
+    }
+    missing_paths = [path for path in required_paths.values() if not path.exists()]
     if missing_paths:
         raise FileNotFoundError(f"Missing interpretation inputs: {missing_paths}")
 
-    inputs = {
-        "beat_features_valid": pd.read_csv(beat_features_valid_path),
-        "learning_input_columns": load_json_list(learning_input_columns_path),
-        "feature_names": load_json_list(feature_names_path),
-        "cluster_assignments_valid": pd.read_csv(assignments_path),
-        "cluster_centers": np.load(cluster_centers_path),
-        "beat_features_all": load_optional_csv(preprocess_root / InterpretationConfig.BEAT_FEATURES_ALL_FILENAME),
-        "record_summary": load_optional_csv(preprocess_root / InterpretationConfig.RECORD_SUMMARY_FILENAME),
+    return {
+        "beat_features_valid": pd.read_csv(required_paths["beat_features_valid"]),
+        "learning_input_columns": load_json_list(required_paths["learning_input_columns"]),
+        "feature_names": load_json_list(required_paths["feature_names"]),
+        "feature_groups": load_json_dict(required_paths["feature_groups"]),
+        "hdbscan_labels_train": pd.read_csv(required_paths["hdbscan_labels_train"]),
+        "all_valid_with_latent": pd.read_csv(required_paths["all_valid_with_latent"]),
+        "clustering_summary": load_json_dict(required_paths["clustering_summary"]),
+        "cluster_exemplars": pd.read_csv(required_paths["cluster_exemplars"]),
+        "cluster_stability_summary": pd.read_csv(required_paths["cluster_stability_summary"]),
+        "record_distribution_summary": pd.read_csv(required_paths["record_distribution_summary"]),
     }
-    logger.info("input file load 완료")
-    return inputs
 
 
-def validate_inputs(inputs: dict[str, Any]) -> None:
+# =================================================
+# 2. Validation / Merge Helpers
+# =================================================
+
+
+def validate_inputs(inputs: dict[str, Any]) -> list[str]:
     beat_features_valid = inputs["beat_features_valid"]
     learning_input_columns = inputs["learning_input_columns"]
     feature_names = inputs["feature_names"]
-    cluster_assignments_valid = inputs["cluster_assignments_valid"]
-    cluster_centers = inputs["cluster_centers"]
+    feature_groups = inputs["feature_groups"]
+    train_assignments = inputs["hdbscan_labels_train"]
+    all_valid_with_latent = inputs["all_valid_with_latent"]
 
-    required_feature_columns = ["record_id", "beat_index", "valid_flag", "source_file", "s1_on", "s1_off", "s2_on", "s2_off", "s1_on_next"]
+    required_feature_columns = ["record_id", "beat_index", "valid_flag", "source_file"]
     missing_feature_columns = [column for column in required_feature_columns if column not in beat_features_valid.columns]
     if missing_feature_columns:
         raise ValueError(f"Missing required columns in beat_features_valid.csv: {missing_feature_columns}")
@@ -180,146 +186,196 @@ def validate_inputs(inputs: dict[str, Any]) -> None:
     if unknown_learning_columns:
         raise ValueError(f"Unknown learning input columns: {unknown_learning_columns}")
 
-    required_assignment_columns = ["record_id", "beat_index", "cluster_label", "cluster_confidence"]
-    required_assignment_columns += [f"q_cluster_{index}" for index in range(InterpretationConfig.NUM_CLUSTERS)]
-    required_assignment_columns += [f"latent_{index:02d}" for index in range(cluster_centers.shape[1])]
-    missing_assignment_columns = [column for column in required_assignment_columns if column not in cluster_assignments_valid.columns]
-    if missing_assignment_columns:
-        raise ValueError(f"Missing required columns in cluster_assignments_valid.csv: {missing_assignment_columns}")
+    if not isinstance(feature_groups, dict) or not feature_groups:
+        raise ValueError("feature_groups.json must contain a non-empty object")
 
-    if cluster_centers.shape != (InterpretationConfig.NUM_CLUSTERS, 12):
-        raise ValueError(
-            f"cluster_centers.npy must have shape {(InterpretationConfig.NUM_CLUSTERS, 12)}, got {cluster_centers.shape}"
-        )
+    latent_columns = sorted(column for column in all_valid_with_latent.columns if column.startswith("latent_"))
+    if not latent_columns:
+        raise ValueError("No latent columns found in all_valid_with_latent.csv")
+
+    required_assignment_columns = ["record_id", "beat_index", "cluster_label", "membership_probability", "outlier_score"]
+    missing_assignment_columns = [column for column in required_assignment_columns if column not in train_assignments.columns]
+    if missing_assignment_columns:
+        raise ValueError(f"Missing required columns in hdbscan_labels_train.csv: {missing_assignment_columns}")
+
+    return latent_columns
 
 
 def build_clustered_valid_beats(
     beat_features_valid: pd.DataFrame,
-    cluster_assignments_valid: pd.DataFrame,
+    train_assignments: pd.DataFrame,
+    all_valid_with_latent: pd.DataFrame,
 ) -> pd.DataFrame:
-    clustered_valid_beats = beat_features_valid.merge(
-        cluster_assignments_valid,
-        on=["record_id", "beat_index"],
+    merged = beat_features_valid.merge(
+        all_valid_with_latent,
+        on=["record_id", "beat_index", "source_file", "cycle_index", "valid_flag", "s1_start", "s1_end", "s2_start", "s2_end", "next_s1_start"],
         how="inner",
         validate="one_to_one",
     )
-    logger.info("merge 완료")
-    return clustered_valid_beats
+
+    train_assignment_columns = [
+        column for column in train_assignments.columns if column not in {"source_file", "cycle_index", "valid_flag"}
+    ]
+    merged = merged.merge(
+        train_assignments.loc[:, train_assignment_columns],
+        on=["record_id", "beat_index"],
+        how="left",
+        validate="one_to_one",
+    )
+
+    for optional_column in [
+        "cluster_label",
+        "membership_probability",
+        "outlier_score",
+        "predicted_cluster_label",
+        "predicted_membership_probability",
+        "nearest_train_cluster_label",
+        "nearest_train_cluster_distance",
+        "split_name",
+    ]:
+        if optional_column not in merged.columns:
+            merged[optional_column] = np.nan
+
+    merged["analysis_cluster_label"] = merged["cluster_label"]
+    predicted_mask = merged["analysis_cluster_label"].isnull() & merged["predicted_cluster_label"].notnull()
+    merged.loc[predicted_mask, "analysis_cluster_label"] = merged.loc[predicted_mask, "predicted_cluster_label"]
+    nearest_mask = merged["analysis_cluster_label"].isnull() & merged["nearest_train_cluster_label"].notnull()
+    merged.loc[nearest_mask, "analysis_cluster_label"] = merged.loc[nearest_mask, "nearest_train_cluster_label"]
+    merged["analysis_cluster_label"] = merged["analysis_cluster_label"].fillna(-1).astype(int)
+
+    merged["analysis_label_source"] = "train_fit"
+    merged.loc[predicted_mask, "analysis_label_source"] = "approximate_predict"
+    merged.loc[nearest_mask, "analysis_label_source"] = "nearest_cluster"
+    merged.loc[merged["analysis_cluster_label"] == -1, "analysis_label_source"] = merged.loc[
+        merged["analysis_cluster_label"] == -1, "analysis_label_source"
+    ].replace("", "noise")
+
+    merged["analysis_membership_probability"] = merged["membership_probability"]
+    replace_probability_mask = merged["analysis_membership_probability"].isnull() & merged["predicted_membership_probability"].notnull()
+    merged.loc[replace_probability_mask, "analysis_membership_probability"] = merged.loc[
+        replace_probability_mask, "predicted_membership_probability"
+    ]
+
+    return merged
 
 
-def compute_cluster_overview(clustered_valid_beats: pd.DataFrame, num_clusters: int) -> pd.DataFrame:
-    total_beats = float(len(clustered_valid_beats))
-    rows: list[dict[str, float | int]] = []
+def get_dynamic_cluster_labels(clustered_valid_beats: pd.DataFrame) -> list[int]:
+    labels = sorted(int(label) for label in clustered_valid_beats["analysis_cluster_label"].dropna().unique())
+    return labels
 
-    for cluster_label in range(num_clusters):
-        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["cluster_label"] == cluster_label]
-        confidence_values = cluster_frame["cluster_confidence"].to_numpy(dtype=np.float64) if not cluster_frame.empty else np.array([], dtype=np.float64)
-        rows.append(
-            {
-                "cluster_label": cluster_label,
-                "beat_count": int(len(cluster_frame)),
-                "beat_ratio": float(len(cluster_frame) / total_beats) if total_beats > 0 else float(np.nan),
-                "confidence_mean": float(np.mean(confidence_values)) if confidence_values.size > 0 else float(np.nan),
-                "confidence_std": float(np.std(confidence_values, ddof=0)) if confidence_values.size > 0 else float(np.nan),
-            }
-        )
 
-    overview = pd.DataFrame(rows)
-    logger.info("cluster별 beat 수: %s", overview.loc[:, ["cluster_label", "beat_count"]].to_dict(orient="records"))
-    return overview
+# =================================================
+# 3. Summary Helpers
+# =================================================
 
 
 def summarize_feature_series(values: np.ndarray) -> dict[str, float]:
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return {
+            "mean": float(np.nan),
+            "std": float(np.nan),
+            "median": float(np.nan),
+            "q25": float(np.nan),
+            "q75": float(np.nan),
+        }
     return {
-        "mean": float(np.mean(values)),
-        "std": float(np.std(values, ddof=0)),
-        "median": float(np.median(values)),
-        "q25": float(np.quantile(values, 0.25)),
-        "q75": float(np.quantile(values, 0.75)),
+        "mean": float(np.mean(finite_values)),
+        "std": float(np.std(finite_values, ddof=0)),
+        "median": float(np.median(finite_values)),
+        "q25": float(np.quantile(finite_values, 0.25)),
+        "q75": float(np.quantile(finite_values, 0.75)),
     }
+
+
+def compute_cluster_overview(clustered_valid_beats: pd.DataFrame) -> pd.DataFrame:
+    total_beats = float(len(clustered_valid_beats))
+    rows: list[dict[str, Any]] = []
+
+    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label].copy()
+        probability_values = cluster_frame["analysis_membership_probability"].to_numpy(dtype=np.float64)
+        rows.append(
+            {
+                "cluster_label": int(cluster_label),
+                "is_noise": int(cluster_label == -1),
+                "beat_count": int(len(cluster_frame)),
+                "beat_ratio": float(len(cluster_frame) / total_beats) if total_beats > 0 else float(np.nan),
+                "num_records": int(cluster_frame["record_id"].nunique()),
+                "train_count": int(np.sum(cluster_frame["split_name"] == "train")) if "split_name" in cluster_frame.columns else 0,
+                "val_count": int(np.sum(cluster_frame["split_name"] == "val")) if "split_name" in cluster_frame.columns else 0,
+                "test_count": int(np.sum(cluster_frame["split_name"] == "test")) if "split_name" in cluster_frame.columns else 0,
+                "membership_probability_mean": float(np.nanmean(probability_values)) if len(cluster_frame) > 0 else float(np.nan),
+                "membership_probability_std": float(np.nanstd(probability_values)) if len(cluster_frame) > 0 else float(np.nan),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def compute_feature_summary(
     clustered_valid_beats: pd.DataFrame,
     learning_input_columns: list[str],
-    num_clusters: int,
 ) -> pd.DataFrame:
-    rows: list[dict[str, float | int | str]] = []
+    rows: list[dict[str, Any]] = []
+    cluster_labels = get_dynamic_cluster_labels(clustered_valid_beats)
 
     for feature_name in learning_input_columns:
         global_values = clustered_valid_beats[feature_name].to_numpy(dtype=np.float64)
-        global_summary = summarize_feature_series(global_values)
         rows.append(
             {
                 "summary_level": "global",
-                "cluster_label": -1,
+                "cluster_label": -999,
                 "feature_name": feature_name,
-                **global_summary,
+                **summarize_feature_series(global_values),
             }
         )
 
-        for cluster_label in range(num_clusters):
+        for cluster_label in cluster_labels:
             cluster_values = clustered_valid_beats.loc[
-                clustered_valid_beats["cluster_label"] == cluster_label,
+                clustered_valid_beats["analysis_cluster_label"] == cluster_label,
                 feature_name,
             ].to_numpy(dtype=np.float64)
-            if cluster_values.size == 0:
-                rows.append(
-                    {
-                        "summary_level": "cluster",
-                        "cluster_label": cluster_label,
-                        "feature_name": feature_name,
-                        "mean": float(np.nan),
-                        "std": float(np.nan),
-                        "median": float(np.nan),
-                        "q25": float(np.nan),
-                        "q75": float(np.nan),
-                    }
-                )
-                continue
-
-            cluster_summary = summarize_feature_series(cluster_values)
             rows.append(
                 {
                     "summary_level": "cluster",
-                    "cluster_label": cluster_label,
+                    "cluster_label": int(cluster_label),
                     "feature_name": feature_name,
-                    **cluster_summary,
+                    **summarize_feature_series(cluster_values),
                 }
             )
 
-    feature_summary = pd.DataFrame(rows)
-    logger.info("feature summary 생성 완료")
-    return feature_summary
+    return pd.DataFrame(rows)
 
 
 def compute_top_features_per_cluster(
     clustered_valid_beats: pd.DataFrame,
     learning_input_columns: list[str],
-    num_clusters: int,
     top_k: int,
     eps: float,
 ) -> pd.DataFrame:
-    rows: list[dict[str, float | int | str]] = []
+    rows: list[dict[str, Any]] = []
     global_means = clustered_valid_beats.loc[:, learning_input_columns].mean(axis=0)
     global_stds = clustered_valid_beats.loc[:, learning_input_columns].std(axis=0, ddof=0)
 
-    for cluster_label in range(num_clusters):
-        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["cluster_label"] == cluster_label]
+    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+        if cluster_label == -1:
+            continue
+        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label]
         if cluster_frame.empty:
             continue
 
-        feature_rows: list[dict[str, float | int | str]] = []
         cluster_means = cluster_frame.loc[:, learning_input_columns].mean(axis=0)
+        feature_rows: list[dict[str, Any]] = []
         for feature_name in learning_input_columns:
             cluster_mean = float(cluster_means[feature_name])
             global_mean = float(global_means[feature_name])
             global_std = float(global_stds[feature_name])
             delta_mean = cluster_mean - global_mean
-            effect_z = delta_mean / (global_std + eps)
+            effect_z = float(delta_mean / (global_std + eps))
             feature_rows.append(
                 {
-                    "cluster_label": cluster_label,
+                    "cluster_label": int(cluster_label),
                     "feature_name": feature_name,
                     "cluster_mean": cluster_mean,
                     "global_mean": global_mean,
@@ -329,52 +385,57 @@ def compute_top_features_per_cluster(
             )
 
         ranked_rows = sorted(feature_rows, key=lambda row: abs(float(row["effect_z"])), reverse=True)[:top_k]
-        for rank, row in enumerate(ranked_rows, start=1):
-            row["rank_within_cluster"] = rank
+        for rank_index, row in enumerate(ranked_rows, start=1):
+            row["rank_within_cluster"] = rank_index
             rows.append(row)
 
-    top_features = pd.DataFrame(rows)
-    logger.info("top feature 추출 완료")
-    return top_features
+    return pd.DataFrame(rows)
 
 
 def compute_feature_group_summary(
-    top_features_per_cluster: pd.DataFrame,
-    learning_input_columns: list[str],
     clustered_valid_beats: pd.DataFrame,
-    num_clusters: int,
+    learning_input_columns: list[str],
+    feature_groups: dict[str, list[str]],
     eps: float,
 ) -> dict[str, dict[str, Any]]:
     global_means = clustered_valid_beats.loc[:, learning_input_columns].mean(axis=0)
     global_stds = clustered_valid_beats.loc[:, learning_input_columns].std(axis=0, ddof=0)
     summary: dict[str, dict[str, Any]] = {}
 
-    for cluster_label in range(num_clusters):
-        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["cluster_label"] == cluster_label]
+    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label]
         cluster_summary: dict[str, Any] = {}
         if cluster_frame.empty:
             summary[f"cluster_{cluster_label}"] = cluster_summary
             continue
 
         cluster_means = cluster_frame.loc[:, learning_input_columns].mean(axis=0)
-        effect_rows = []
-        for feature_name in learning_input_columns:
-            delta_mean = float(cluster_means[feature_name] - global_means[feature_name])
-            effect_z = delta_mean / (float(global_stds[feature_name]) + eps)
-            effect_rows.append(
-                {
-                    "feature_name": feature_name,
-                    "effect_z": effect_z,
+        for group_name, group_columns in feature_groups.items():
+            usable_columns = [column for column in group_columns if column in learning_input_columns]
+            if not usable_columns:
+                cluster_summary[group_name] = {
+                    "group_feature_count": 0,
+                    "mean_abs_effect_z": float(np.nan),
+                    "top_features": [],
                 }
-            )
+                continue
 
-        for prefix in FEATURE_GROUP_PREFIXES:
-            group_rows = [row for row in effect_rows if str(row["feature_name"]).startswith(prefix)]
-            ranked_group_rows = sorted(group_rows, key=lambda row: abs(float(row["effect_z"])), reverse=True)
-            cluster_summary[prefix] = {
-                "group_feature_count": int(len(group_rows)),
-                "mean_abs_effect_z": float(np.mean([abs(float(row["effect_z"])) for row in group_rows])) if group_rows else float(np.nan),
-                "top_features": [str(row["feature_name"]) for row in ranked_group_rows[:5]],
+            effect_rows: list[dict[str, Any]] = []
+            for feature_name in usable_columns:
+                delta_mean = float(cluster_means[feature_name] - global_means[feature_name])
+                effect_z = float(delta_mean / (float(global_stds[feature_name]) + eps))
+                effect_rows.append(
+                    {
+                        "feature_name": feature_name,
+                        "effect_z": effect_z,
+                    }
+                )
+
+            ranked_rows = sorted(effect_rows, key=lambda row: abs(float(row["effect_z"])), reverse=True)
+            cluster_summary[group_name] = {
+                "group_feature_count": int(len(usable_columns)),
+                "mean_abs_effect_z": float(np.mean([abs(float(row["effect_z"])) for row in effect_rows])),
+                "top_features": [str(row["feature_name"]) for row in ranked_rows[:5]],
             }
 
         summary[f"cluster_{cluster_label}"] = cluster_summary
@@ -382,64 +443,118 @@ def compute_feature_group_summary(
     return summary
 
 
-def compute_representative_beats(
-    clustered_valid_beats: pd.DataFrame,
-    cluster_centers: np.ndarray,
-    num_clusters: int,
-    representative_count: int,
-) -> pd.DataFrame:
-    latent_columns = [f"latent_{index:02d}" for index in range(cluster_centers.shape[1])]
-    rows: list[dict[str, float | int | str]] = []
+def compute_entropy_from_counts(counts: np.ndarray) -> float:
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        return float(np.nan)
+    probabilities = counts.astype(np.float64) / total
+    probabilities = probabilities[probabilities > 0]
+    if probabilities.size == 0:
+        return float(np.nan)
+    return float(-np.sum(probabilities * np.log(probabilities)))
 
-    for cluster_label in range(num_clusters):
-        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["cluster_label"] == cluster_label].copy()
-        if cluster_frame.empty:
+
+def compute_record_cluster_distribution(clustered_valid_beats: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label]
+        record_counts = cluster_frame["record_id"].astype(str).value_counts()
+        rows.append(
+            {
+                "cluster_label": int(cluster_label),
+                "beat_count": int(len(cluster_frame)),
+                "num_records": int(record_counts.shape[0]),
+                "record_distribution_entropy": compute_entropy_from_counts(record_counts.to_numpy(dtype=np.int64)),
+                "top_record_id": str(record_counts.index[0]) if not record_counts.empty else "",
+                "top_record_fraction": float(record_counts.iloc[0] / max(1, len(cluster_frame))) if not record_counts.empty else float(np.nan),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# =================================================
+# 4. Heuristic Summary Helpers
+# =================================================
+
+
+def _heuristic_signal(
+    cluster_mean: float,
+    global_mean: float,
+    global_std: float,
+    eps: float,
+) -> float:
+    return float((cluster_mean - global_mean) / (global_std + eps))
+
+
+def build_cluster_heuristic_summary(
+    clustered_valid_beats: pd.DataFrame,
+    learning_input_columns: list[str],
+    eps: float,
+) -> dict[int, list[str]]:
+    global_means = clustered_valid_beats.loc[:, learning_input_columns].mean(axis=0)
+    global_stds = clustered_valid_beats.loc[:, learning_input_columns].std(axis=0, ddof=0)
+    heuristics: dict[int, list[str]] = {}
+
+    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+        cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label]
+        cluster_means = cluster_frame.loc[:, learning_input_columns].mean(axis=0)
+        messages: list[str] = []
+
+        if cluster_label == -1:
+            messages.append("noise-like pattern 가능성: density clustering 기준으로 안정된 군집 밖 샘플 비율이 높음")
+            heuristics[cluster_label] = messages
             continue
 
-        cluster_latent = cluster_frame.loc[:, latent_columns].to_numpy(dtype=np.float64)
-        center = cluster_centers[cluster_label].astype(np.float64)
-        distances = np.linalg.norm(cluster_latent - center[None, :], axis=1)
-        cluster_frame["distance_to_center"] = distances.astype(np.float64)
-        cluster_frame = cluster_frame.sort_values(["distance_to_center", "record_id", "beat_index"], kind="stable").reset_index(drop=True)
+        systole_energy_signal = _heuristic_signal(
+            float(cluster_means.get("seg_sys_energy", 0.0)),
+            float(global_means.get("seg_sys_energy", 0.0)),
+            float(global_stds.get("seg_sys_energy", 0.0)),
+            eps,
+        )
+        systole_occupancy_signal = _heuristic_signal(
+            float(cluster_means.get("seg_sys_env_occupancy", 0.0)),
+            float(global_means.get("seg_sys_env_occupancy", 0.0)),
+            float(global_stds.get("seg_sys_env_occupancy", 0.0)),
+            eps,
+        )
+        ed_energy_signal = _heuristic_signal(
+            float(cluster_means.get("zone_ed_energy", 0.0)),
+            float(global_means.get("zone_ed_energy", 0.0)),
+            float(global_stds.get("zone_ed_energy", 0.0)),
+            eps,
+        )
+        ld_peak_signal = _heuristic_signal(
+            float(cluster_means.get("zone_ld_peak_rel_to_s1", 0.0)),
+            float(global_means.get("zone_ld_peak_rel_to_s1", 0.0)),
+            float(global_stds.get("zone_ld_peak_rel_to_s1", 0.0)),
+            eps,
+        )
+        hr_signal = _heuristic_signal(
+            float(cluster_means.get("global_hr_bpm", 0.0)),
+            float(global_means.get("global_hr_bpm", 0.0)),
+            float(global_stds.get("global_hr_bpm", 0.0)),
+            eps,
+        )
 
-        selected_frame = cluster_frame.head(representative_count).copy()
-        for rank, (_, selected_row) in enumerate(selected_frame.iterrows(), start=1):
-            rows.append(
-                {
-                    "cluster_label": cluster_label,
-                    "record_id": selected_row["record_id"],
-                    "beat_index": int(selected_row["beat_index"]),
-                    "rank_in_cluster": rank,
-                    "distance_to_center": float(selected_row["distance_to_center"]),
-                    "cluster_confidence": float(selected_row["cluster_confidence"]),
-                    "source_file": selected_row["source_file"],
-                    "s1_on": int(selected_row["s1_on"]),
-                    "s1_off": int(selected_row["s1_off"]),
-                    "s2_on": int(selected_row["s2_on"]),
-                    "s2_off": int(selected_row["s2_off"]),
-                    "s1_on_next": int(selected_row["s1_on_next"]),
-                }
-            )
+        if systole_energy_signal > 0.8 and systole_occupancy_signal > 0.8:
+            messages.append("systole energy and occupancy가 높아 murmur-like pattern 가능성")
+        if ed_energy_signal > 0.8:
+            messages.append("early diastole zone energy가 높아 S3-like pattern 가능성")
+        if ld_peak_signal > 0.8:
+            messages.append("late diastole zone peak가 높아 S4-like pattern 가능성")
+        if hr_signal > 0.8:
+            messages.append("cycle HR이 높아 tachycardia-like pattern 가능성")
+        if not messages:
+            messages.append("특정 임상적 heuristic이 두드러지지 않는 mixed pattern")
 
-    representative_beats = pd.DataFrame(rows)
-    logger.info("representative beat 선택 완료")
-    return representative_beats
+        heuristics[cluster_label] = messages
+
+    return heuristics
 
 
-def compute_record_cluster_distribution(clustered_valid_beats: pd.DataFrame, num_clusters: int) -> pd.DataFrame:
-    rows: list[dict[str, float | int | str]] = []
-    for record_id, record_frame in clustered_valid_beats.groupby("record_id", sort=True):
-        total_valid_beats = int(len(record_frame))
-        row: dict[str, float | int | str] = {
-            "record_id": record_id,
-            "total_valid_beat_count": total_valid_beats,
-        }
-        for cluster_label in range(num_clusters):
-            cluster_count = int(np.sum(record_frame["cluster_label"].to_numpy(dtype=np.int64) == cluster_label))
-            row[f"cluster_{cluster_label}_count"] = cluster_count
-            row[f"cluster_{cluster_label}_ratio"] = float(cluster_count / total_valid_beats) if total_valid_beats > 0 else float(np.nan)
-        rows.append(row)
-    return pd.DataFrame(rows)
+# =================================================
+# 5. Representative Beat / Figure Helpers
+# =================================================
 
 
 def normalize_column_name(column_name: Any) -> str:
@@ -470,15 +585,34 @@ def load_source_signal(file_path: Path) -> np.ndarray:
     dataframe.columns = [normalize_column_name(column_name) for column_name in dataframe.columns]
     if "Amplitude" not in dataframe.columns:
         raise ValueError(f"Amplitude column is required in {file_path}")
-    amplitude = pd.to_numeric(dataframe["Amplitude"], errors="raise").to_numpy(dtype=np.float32)
-    return amplitude
+    return pd.to_numeric(dataframe["Amplitude"], errors="raise").to_numpy(dtype=np.float32)
 
 
-def compute_smoothed_envelope(x: np.ndarray, fs: int, smooth_ms: float) -> np.ndarray:
-    envelope_raw = np.abs(hilbert(x))
-    window_size = max(3, int(round((smooth_ms / 1000.0) * fs)))
-    kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
-    return np.convolve(envelope_raw.astype(np.float32), kernel, mode="same").astype(np.float32)
+def compute_smoothed_envelope(x: np.ndarray, fs: float, smooth_ms: float) -> np.ndarray:
+    if x.size == 0:
+        return np.array([], dtype=np.float32)
+    abs_values = np.abs(x.astype(np.float32, copy=False))
+    radius = max(1, int(round((smooth_ms / 1000.0) * fs / 2.0)))
+    prefix = np.zeros(abs_values.size + 1, dtype=np.float64)
+    prefix[1:] = np.cumsum(abs_values, dtype=np.float64)
+    smoothed = np.zeros(abs_values.size, dtype=np.float32)
+    for index in range(abs_values.size):
+        start = max(0, index - radius)
+        end = min(abs_values.size - 1, index + radius)
+        smoothed[index] = float((prefix[end + 1] - prefix[start]) / max(1, end - start + 1))
+    return smoothed
+
+
+def _load_matplotlib_pyplot() -> Any:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as error:
+        raise ImportError("matplotlib is required to export representative figures") from error
+
+    return plt
 
 
 def plot_representative_beat(
@@ -486,27 +620,26 @@ def plot_representative_beat(
     envelope: np.ndarray,
     representative_row: pd.Series,
     save_path: Path,
-    fs: int,
+    fs: float,
 ) -> None:
-    start = int(representative_row["s1_on"])
-    end = int(representative_row["s1_on_next"])
+    plt = _load_matplotlib_pyplot()
+
+    start = int(representative_row["s1_start"])
+    end = int(representative_row["next_s1_start"])
     beat_signal = signal[start:end]
     beat_envelope = envelope[start:end]
     time_ms = np.arange(len(beat_signal), dtype=np.float64) * (1000.0 / float(fs))
 
     boundary_offsets = {
-        "S1 on": 0,
-        "S1 off": int(representative_row["s1_off"]) - start,
-        "S2 on": int(representative_row["s2_on"]) - start,
-        "S2 off": int(representative_row["s2_off"]) - start,
+        "S1 start": int(representative_row["s1_start"]) - start,
+        "S1 end": int(representative_row["s1_end"]) - start,
+        "S2 start": int(representative_row["s2_start"]) - start,
+        "S2 end": int(representative_row["s2_end"]) - start,
     }
-    max_envelope = float(np.max(beat_envelope)) if beat_envelope.size > 0 else 1.0
-    normalized_envelope = beat_envelope / (max_envelope + InterpretationConfig.EPS)
-    envelope_overlay = normalized_envelope * (np.max(np.abs(beat_signal)) + InterpretationConfig.EPS)
 
     plt.figure(figsize=(10, 4))
     plt.plot(time_ms, beat_signal, color="#1f4e78", linewidth=1.2, label="PCG")
-    plt.plot(time_ms, envelope_overlay, color="#d95f02", linewidth=1.5, alpha=0.9, label="Envelope")
+    plt.plot(time_ms, beat_envelope, color="#d95f02", linewidth=1.3, alpha=0.9, label="Smoothed envelope")
     for label, offset in boundary_offsets.items():
         if 0 <= offset < len(time_ms):
             plt.axvline(time_ms[offset], linestyle="--", linewidth=1.0, label=label)
@@ -527,77 +660,79 @@ def plot_representative_beat(
     plt.close()
 
 
-def export_representative_figures(
-    representative_beats: pd.DataFrame,
-    data_root: Path,
-    figures_root: Path,
-    fs: int,
-    smooth_ms: float,
-) -> None:
-    cached_signals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    if representative_beats.empty:
-        return
-
-    for _, row in representative_beats.iterrows():
-        source_file = str(row["source_file"])
-        source_path = data_root / source_file
-        if source_file not in cached_signals:
-            signal = load_source_signal(source_path)
-            envelope = compute_smoothed_envelope(signal, fs=fs, smooth_ms=smooth_ms)
-            cached_signals[source_file] = (signal, envelope)
-        signal, envelope = cached_signals[source_file]
-
-        cluster_dir = figures_root / f"cluster_{int(row['cluster_label'])}"
-        cluster_dir.mkdir(parents=True, exist_ok=True)
-        save_path = cluster_dir / f"representative_rank_{int(row['rank_in_cluster'])}.png"
-        plot_representative_beat(signal=signal, envelope=envelope, representative_row=row, save_path=save_path, fs=fs)
-    logger.info("representative waveform figure 저장 완료")
-
-
-def export_umap_figure(
+def build_representative_beats(
     clustered_valid_beats: pd.DataFrame,
+    cluster_exemplars: pd.DataFrame,
+    heuristics: dict[int, list[str]],
     figures_root: Path,
-    random_seed: int,
-    n_neighbors: int,
-    min_dist: float,
-) -> None:
-    try:
-        import umap.umap_ as umap
-    except ImportError as error:
-        raise ImportError("UMAP is required for interpretation visualization") from error
+    data_root: Path,
+) -> pd.DataFrame:
+    if cluster_exemplars.empty:
+        return pd.DataFrame()
 
-    latent_columns = [column for column in clustered_valid_beats.columns if column.startswith("latent_")]
-    latent_matrix = clustered_valid_beats.loc[:, latent_columns].to_numpy(dtype=np.float32)
-
-    reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
-        random_state=random_seed,
+    merged = cluster_exemplars.merge(
+        clustered_valid_beats,
+        on=["record_id", "beat_index"],
+        how="left",
+        validate="one_to_one",
     )
-    embedding = reducer.fit_transform(latent_matrix)
-    plot_frame = clustered_valid_beats.loc[:, ["cluster_label"]].copy()
-    plot_frame["umap_0"] = embedding[:, 0]
-    plot_frame["umap_1"] = embedding[:, 1]
+    if merged.empty:
+        return merged
 
-    plt.figure(figsize=(8, 6))
-    for cluster_label in range(InterpretationConfig.NUM_CLUSTERS):
-        cluster_frame = plot_frame.loc[plot_frame["cluster_label"] == cluster_label]
-        plt.scatter(
-            cluster_frame["umap_0"],
-            cluster_frame["umap_1"],
-            s=18,
-            alpha=0.7,
-            label=f"cluster_{cluster_label}",
-        )
-    plt.xlabel("UMAP 1")
-    plt.ylabel("UMAP 2")
-    plt.title("Latent UMAP by Cluster")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(figures_root / "latent_umap_by_cluster.png", dpi=150)
-    plt.close()
-    logger.info("UMAP figure 저장 완료")
+    keep_columns = [
+        "cluster_label",
+        "exemplar_rank",
+        "record_id",
+        "beat_index",
+        "source_file",
+        "distance_to_cluster_mean",
+        "analysis_cluster_label",
+        "analysis_label_source",
+        "analysis_membership_probability",
+        "s1_start",
+        "s1_end",
+        "s2_start",
+        "s2_end",
+        "next_s1_start",
+        "seg_s1_peak_env",
+        "seg_sys_energy",
+        "seg_s2_peak_env",
+        "zone_ed_energy",
+        "zone_ld_peak_rel_to_s1",
+        "global_hr_bpm",
+    ]
+    keep_columns = [column for column in keep_columns if column in merged.columns]
+    representative_beats = merged.loc[:, keep_columns].copy()
+    representative_beats = representative_beats.rename(columns={"exemplar_rank": "rank_in_cluster"})
+    representative_beats["heuristic_summary"] = representative_beats["cluster_label"].map(
+        lambda label: " | ".join(heuristics.get(int(label), []))
+    )
+    representative_beats["waveform_figure_path"] = ""
+
+    try:
+        cached_signals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for row_index, row in representative_beats.iterrows():
+            source_file = str(row["source_file"])
+            source_path = data_root / source_file
+            if source_file not in cached_signals:
+                signal = load_source_signal(source_path)
+                envelope = compute_smoothed_envelope(signal, fs=InterpretationConfig.SAMPLING_RATE, smooth_ms=InterpretationConfig.ENVELOPE_SMOOTH_MS)
+                cached_signals[source_file] = (signal, envelope)
+            signal, envelope = cached_signals[source_file]
+            cluster_dir = figures_root / f"cluster_{int(row['cluster_label'])}"
+            cluster_dir.mkdir(parents=True, exist_ok=True)
+            save_path = cluster_dir / f"representative_rank_{int(row['rank_in_cluster'])}.png"
+            plot_representative_beat(signal=signal, envelope=envelope, representative_row=row, save_path=save_path, fs=InterpretationConfig.SAMPLING_RATE)
+            representative_beats.loc[row_index, "waveform_figure_path"] = str(save_path)
+    except Exception as error:
+        logger.warning("대표 beat figure 생성 생략: %s", error)
+
+    return representative_beats
+
+
+# =================================================
+# 6. JSON / Excel Helpers
+# =================================================
 
 
 def build_json_summary(
@@ -605,8 +740,13 @@ def build_json_summary(
     top_features_per_cluster: pd.DataFrame,
     feature_group_summary: dict[str, dict[str, Any]],
     representative_beats: pd.DataFrame,
+    heuristics: dict[int, list[str]],
+    clustering_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    summary: dict[str, Any] = {"clusters": {}}
+    summary: dict[str, Any] = {
+        "clustering_summary": clustering_summary,
+        "clusters": {},
+    }
     for _, overview_row in cluster_overview.iterrows():
         cluster_label = int(overview_row["cluster_label"])
         cluster_key = f"cluster_{cluster_label}"
@@ -619,28 +759,78 @@ def build_json_summary(
         summary["clusters"][cluster_key] = {
             "beat_count": int(overview_row["beat_count"]),
             "beat_ratio": float(overview_row["beat_ratio"]),
-            "confidence_mean": float(overview_row["confidence_mean"]) if pd.notna(overview_row["confidence_mean"]) else float(np.nan),
+            "num_records": int(overview_row["num_records"]),
+            "is_noise": bool(overview_row["is_noise"]),
+            "heuristic_summary": heuristics.get(cluster_label, []),
             "top_features": cluster_top_features.to_dict(orient="records"),
             "feature_group_summary": feature_group_summary.get(cluster_key, {}),
-            "representative_beats": cluster_representatives.loc[
-                :,
-                ["record_id", "beat_index", "rank_in_cluster", "distance_to_center", "cluster_confidence"],
-            ].to_dict(orient="records"),
+            "representative_beats": cluster_representatives.to_dict(orient="records"),
         }
     return summary
 
 
-def save_outputs(
-    interpretation_root: Path,
-    cluster_overview: pd.DataFrame,
-    feature_summary: pd.DataFrame,
-    top_features_per_cluster: pd.DataFrame,
-    feature_group_summary: dict[str, dict[str, Any]],
-    representative_beats: pd.DataFrame,
-    record_cluster_distribution: pd.DataFrame,
-    clustered_valid_beats: pd.DataFrame,
-    json_summary: dict[str, Any],
-) -> None:
+# =================================================
+# 7. Main
+# =================================================
+
+
+def main() -> None:
+    output_paths = ensure_output_directories(stage_output_folder=configured_path(InterpretationConfig.OUTPUT_FOLDER))
+    interpretation_root = output_paths["interpretation_root"]
+    figures_root = output_paths["figures_root"]
+
+    preprocess_root = configured_path(InterpretationConfig.PREPROCESS_INPUT_FOLDER)
+    clustering_root = configured_path(InterpretationConfig.CLUSTERING_INPUT_FOLDER)
+    data_root = configured_path(InterpretationConfig.TRAIN_DATA_FOLDER)
+
+    logger.info("전처리 입력 폴더: %s", preprocess_root)
+    logger.info("클러스터링 입력 폴더: %s", clustering_root)
+    logger.info("해석 출력 폴더: %s", interpretation_root)
+
+    inputs = load_interpretation_inputs(preprocess_root=preprocess_root, clustering_root=clustering_root)
+    latent_columns = validate_inputs(inputs)
+
+    clustered_valid_beats = build_clustered_valid_beats(
+        beat_features_valid=inputs["beat_features_valid"],
+        train_assignments=inputs["hdbscan_labels_train"],
+        all_valid_with_latent=inputs["all_valid_with_latent"],
+    )
+    clustered_valid_beats.to_csv(interpretation_root / InterpretationConfig.CLUSTERED_VALID_BEATS_FILENAME, index=False)
+
+    learning_input_columns = list(inputs["learning_input_columns"])
+    feature_groups = dict(inputs["feature_groups"])
+
+    cluster_overview = compute_cluster_overview(clustered_valid_beats)
+    feature_summary = compute_feature_summary(
+        clustered_valid_beats=clustered_valid_beats,
+        learning_input_columns=learning_input_columns,
+    )
+    top_features_per_cluster = compute_top_features_per_cluster(
+        clustered_valid_beats=clustered_valid_beats,
+        learning_input_columns=learning_input_columns,
+        top_k=InterpretationConfig.TOP_FEATURES_PER_CLUSTER,
+        eps=InterpretationConfig.EPS,
+    )
+    feature_group_summary = compute_feature_group_summary(
+        clustered_valid_beats=clustered_valid_beats,
+        learning_input_columns=learning_input_columns,
+        feature_groups=feature_groups,
+        eps=InterpretationConfig.EPS,
+    )
+    record_cluster_distribution = compute_record_cluster_distribution(clustered_valid_beats)
+    heuristics = build_cluster_heuristic_summary(
+        clustered_valid_beats=clustered_valid_beats,
+        learning_input_columns=learning_input_columns,
+        eps=InterpretationConfig.EPS,
+    )
+    representative_beats = build_representative_beats(
+        clustered_valid_beats=clustered_valid_beats,
+        cluster_exemplars=inputs["cluster_exemplars"],
+        heuristics=heuristics,
+        figures_root=figures_root,
+        data_root=data_root,
+    )
+
     cluster_overview.to_csv(interpretation_root / InterpretationConfig.CLUSTER_OVERVIEW_FILENAME, index=False)
     feature_summary.to_csv(interpretation_root / InterpretationConfig.FEATURE_SUMMARY_FILENAME, index=False)
     top_features_per_cluster.to_csv(interpretation_root / InterpretationConfig.TOP_FEATURES_FILENAME, index=False)
@@ -649,11 +839,18 @@ def save_outputs(
         interpretation_root / InterpretationConfig.RECORD_CLUSTER_DISTRIBUTION_FILENAME,
         index=False,
     )
-    clustered_valid_beats.to_csv(interpretation_root / InterpretationConfig.CLUSTERED_VALID_BEATS_FILENAME, index=False)
-
     (interpretation_root / InterpretationConfig.FEATURE_GROUP_SUMMARY_FILENAME).write_text(
         json.dumps(feature_group_summary, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
+    )
+
+    json_summary = build_json_summary(
+        cluster_overview=cluster_overview,
+        top_features_per_cluster=top_features_per_cluster,
+        feature_group_summary=feature_group_summary,
+        representative_beats=representative_beats,
+        heuristics=heuristics,
+        clustering_summary=inputs["clustering_summary"],
     )
     (interpretation_root / InterpretationConfig.JSON_SUMMARY_FILENAME).write_text(
         json.dumps(json_summary, indent=2, ensure_ascii=False) + "\n",
@@ -664,107 +861,23 @@ def save_outputs(
         workbook_path=interpretation_root / InterpretationConfig.EXCEL_REPORT_FILENAME,
         sheets={
             "cluster_overview": cluster_overview,
-            "top_features": top_features_per_cluster,
             "feature_summary": feature_summary,
+            "top_features": top_features_per_cluster,
             "representative_beats": representative_beats,
             "record_cluster_distribution": record_cluster_distribution,
+            "cluster_stability_summary": inputs["cluster_stability_summary"],
+            "record_distribution_from_clustering": inputs["record_distribution_summary"],
         },
         freeze_panes=InterpretationConfig.EXCEL_FREEZE_PANES,
         header_fill=InterpretationConfig.EXCEL_HEADER_FILL,
         header_font_color=InterpretationConfig.EXCEL_HEADER_FONT_COLOR,
         max_column_width=InterpretationConfig.EXCEL_MAX_COLUMN_WIDTH,
     )
-    logger.info("Excel / JSON report 저장 완료")
 
-
-def main() -> None:
-    config = InterpretationConfig()
-    output_paths = ensure_output_directories(stage_output_folder=configured_path(config.OUTPUT_FOLDER))
-    interpretation_root = output_paths["interpretation_root"]
-    figures_root = output_paths["figures_root"]
-    preprocess_input_root = configured_path(config.PREPROCESS_INPUT_FOLDER)
-    clustering_input_root = configured_path(config.CLUSTERING_INPUT_FOLDER)
-    train_data_root = configured_path(config.TRAIN_DATA_FOLDER)
-
-    logger.info("전처리 입력 폴더: %s", preprocess_input_root)
-    logger.info("클러스터링 입력 폴더: %s", clustering_input_root)
-    logger.info("원본 데이터 폴더: %s", train_data_root)
-    logger.info("해석 출력 폴더: %s", interpretation_root)
-
-    inputs = load_interpretation_inputs(
-        preprocess_root=preprocess_input_root,
-        clustering_root=clustering_input_root,
-    )
-    validate_inputs(inputs)
-
-    clustered_valid_beats = build_clustered_valid_beats(
-        beat_features_valid=inputs["beat_features_valid"],
-        cluster_assignments_valid=inputs["cluster_assignments_valid"],
-    )
-    cluster_overview = compute_cluster_overview(
-        clustered_valid_beats=clustered_valid_beats,
-        num_clusters=config.NUM_CLUSTERS,
-    )
-    feature_summary = compute_feature_summary(
-        clustered_valid_beats=clustered_valid_beats,
-        learning_input_columns=inputs["learning_input_columns"],
-        num_clusters=config.NUM_CLUSTERS,
-    )
-    top_features_per_cluster = compute_top_features_per_cluster(
-        clustered_valid_beats=clustered_valid_beats,
-        learning_input_columns=inputs["learning_input_columns"],
-        num_clusters=config.NUM_CLUSTERS,
-        top_k=config.TOP_FEATURES_PER_CLUSTER,
-        eps=config.EPS,
-    )
-    feature_group_summary = compute_feature_group_summary(
-        top_features_per_cluster=top_features_per_cluster,
-        learning_input_columns=inputs["learning_input_columns"],
-        clustered_valid_beats=clustered_valid_beats,
-        num_clusters=config.NUM_CLUSTERS,
-        eps=config.EPS,
-    )
-    representative_beats = compute_representative_beats(
-        clustered_valid_beats=clustered_valid_beats,
-        cluster_centers=inputs["cluster_centers"],
-        num_clusters=config.NUM_CLUSTERS,
-        representative_count=config.REPRESENTATIVE_BEATS_PER_CLUSTER,
-    )
-    export_representative_figures(
-        representative_beats=representative_beats,
-        data_root=train_data_root,
-        figures_root=figures_root,
-        fs=config.SAMPLING_RATE,
-        smooth_ms=config.ENVELOPE_SMOOTH_MS,
-    )
-    record_cluster_distribution = compute_record_cluster_distribution(
-        clustered_valid_beats=clustered_valid_beats,
-        num_clusters=config.NUM_CLUSTERS,
-    )
-    export_umap_figure(
-        clustered_valid_beats=clustered_valid_beats,
-        figures_root=figures_root,
-        random_seed=config.RANDOM_SEED,
-        n_neighbors=config.UMAP_N_NEIGHBORS,
-        min_dist=config.UMAP_MIN_DIST,
-    )
-
-    json_summary = build_json_summary(
-        cluster_overview=cluster_overview,
-        top_features_per_cluster=top_features_per_cluster,
-        feature_group_summary=feature_group_summary,
-        representative_beats=representative_beats,
-    )
-    save_outputs(
-        interpretation_root=interpretation_root,
-        cluster_overview=cluster_overview,
-        feature_summary=feature_summary,
-        top_features_per_cluster=top_features_per_cluster,
-        feature_group_summary=feature_group_summary,
-        representative_beats=representative_beats,
-        record_cluster_distribution=record_cluster_distribution,
-        clustered_valid_beats=clustered_valid_beats,
-        json_summary=json_summary,
+    logger.info(
+        "해석 완료: clusters=%s, representative_beats=%s",
+        cluster_overview["cluster_label"].tolist(),
+        len(representative_beats),
     )
 
 

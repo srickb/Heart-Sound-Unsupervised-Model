@@ -1,5 +1,5 @@
 """
-Cycle-level preprocessing script aligned to the current HeartSound Tool parameter design.
+Cycle-level preprocessing script for the revised Heart-Sound-Unsupervised-Model pipeline.
 
 Expected input schema per tabular file (.xlsx or .csv):
 - Amplitude
@@ -8,15 +8,14 @@ Expected input schema per tabular file (.xlsx or .csv):
 - S2-Start_RS_Score
 - S2-End_RS_Score
 
-Optional column:
-- Time_Index (ignored during preprocessing)
-
 Saved artifacts:
 - outputs/{RUN_NAME}/preprocess/beat_features_all.csv
 - outputs/{RUN_NAME}/preprocess/beat_features_valid.csv
 - outputs/{RUN_NAME}/preprocess/record_summary.csv
 - outputs/{RUN_NAME}/preprocess/feature_names.json
 - outputs/{RUN_NAME}/preprocess/learning_input_columns.json
+- outputs/{RUN_NAME}/preprocess/feature_groups.json
+- outputs/{RUN_NAME}/preprocess/preprocess_summary.json
 - outputs/{RUN_NAME}/preprocess/preprocess_export.xlsx
 """
 
@@ -25,12 +24,16 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from excel_export_utils import export_stage_workbook
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 
 class PreprocessConfig:
@@ -43,27 +46,22 @@ class PreprocessConfig:
     FILE_GLOB = "*"
     SUPPORTED_INPUT_SUFFIXES = (".xlsx", ".csv")
     CSV_ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
+
     SAMPLING_RATE = 4000.0
     SAMPLE_MS = 1000.0 / SAMPLING_RATE
     REGION_THRESHOLD = 15.0
     DEFAULT_CYCLE_SPACING = 4000
     MAX_REGION_WIDTH_RATIO = 0.45
-    EPS = 1e-12
+    EPS = 1e-8
 
-    DIASTOLIC_WINDOW_MIN_DURATION_MS = 18.0
-    CANDIDATE_MIN_WINDOW_MULTIPLIER = 2
-    S3_WINDOW_CONFIG = {
-        "offset_start_ms": 120.0,
-        "offset_end_ms": 200.0,
-        "fallback_start_ratio": 0.18,
-        "fallback_end_ratio": 0.34,
-    }
-    S4_WINDOW_CONFIG = {
-        "offset_start_ms": 200.0,
-        "offset_end_ms": 80.0,
-        "fallback_start_ratio": 0.72,
-        "fallback_end_ratio": 0.88,
-    }
+    ENVELOPE_SMOOTH_MS = 20.0
+    ENVELOPE_OCCUPANCY_THRESHOLD_RATIO = 0.30
+    TEMPLATE_RESAMPLE_POINTS = 64
+    TEMPLATE_MIN_VALID_SEGMENTS = 3
+
+    EARLY_DIASTOLE_RATIO = (0.00, 0.33)
+    MID_DIASTOLE_RATIO = (0.33, 0.66)
+    LATE_DIASTOLE_RATIO = (0.66, 1.00)
 
     EXPECTED_COLUMNS = [
         "Amplitude",
@@ -71,6 +69,14 @@ class PreprocessConfig:
         "S1-End_RS_Score",
         "S2-Start_RS_Score",
         "S2-End_RS_Score",
+    ]
+
+    KEY_RECORD_SUMMARY_COLUMNS = [
+        "global_cycle_length_ms",
+        "global_hr_bpm",
+        "seg_sys_energy",
+        "zone_ed_peak_rel_to_s2",
+        "zone_ld_peak_rel_to_s1",
     ]
 
     EXPORT_EXCEL = True
@@ -84,88 +90,121 @@ class PreprocessConfig:
     EXCEL_MAX_COLUMN_WIDTH = 40
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# =================================================
+# 1. Feature Schema
+# =================================================
 
 
-S1_PARAMETER_COLUMNS = [
-    "S1_Width_ms",
-    "S1_Peak_mV",
-    "S1_mean_mV",
-    "S1_RMS_mV",
-    "S1_Area_mVms",
-    "S1_Sumation",
+GLOBAL_FEATURE_COLUMNS = [
+    "global_cycle_length_ms",
+    "global_hr_bpm",
+    "global_s1_width_ratio",
+    "global_s2_width_ratio",
+    "global_systole_ratio",
+    "global_diastole_ratio",
+    "global_total_energy",
+    "global_env_mean",
+    "global_env_peak",
+    "global_env_rms",
 ]
 
-S2_PARAMETER_COLUMNS = [
-    "S2_Width_ms",
-    "S2_Peak_mV",
-    "S2_mean_mV",
-    "S2_RMS_mV",
-    "S2_Area_mVms",
-    "S2_Sumation",
+SEGMENT_TEMPLATE_SUFFIXES = [
+    "duration_ms",
+    "mean_env",
+    "peak_env",
+    "rms",
+    "energy",
+    "energy_ratio_to_cycle",
+    "energy_centroid",
+    "energy_spread",
+    "env_occupancy",
 ]
 
-SYSTOLE_PARAMETER_COLUMNS = [
-    "Systole_Duration_ms",
-    "Systole_Peak_mV",
-    "Systole_mean_mV",
+ZONE_TEMPLATE_SUFFIXES = [
+    "duration_ms",
+    "mean_env",
+    "peak_env",
+    "rms",
+    "energy",
+    "energy_ratio_to_diastole",
+    "peak_timing_relative",
+    "energy_centroid",
+    "energy_spread",
+    "env_occupancy",
 ]
 
-DIASTOLE_PARAMETER_COLUMNS = [
-    "Diastole_Duration_ms",
-    "Diastole_Peak_mV",
-    "Diastole_mean_mV",
-    "Diastole_S3_Expected_Delta_mV",
-    "Diastole_NaN_Gap_Delta_mV",
-    "Diastole_S4_Expected_Delta_mV",
+SEGMENT_S1_COLUMNS = [f"seg_s1_{suffix}" for suffix in SEGMENT_TEMPLATE_SUFFIXES]
+SEGMENT_SYSTOLE_COLUMNS = [f"seg_sys_{suffix}" for suffix in SEGMENT_TEMPLATE_SUFFIXES]
+SEGMENT_S2_COLUMNS = [f"seg_s2_{suffix}" for suffix in SEGMENT_TEMPLATE_SUFFIXES]
+SEGMENT_DIASTOLE_COLUMNS = [f"seg_dia_{suffix}" for suffix in SEGMENT_TEMPLATE_SUFFIXES]
+
+ZONE_EARLY_COLUMNS = [f"zone_ed_{suffix}" for suffix in ZONE_TEMPLATE_SUFFIXES]
+ZONE_MID_COLUMNS = [f"zone_md_{suffix}" for suffix in ZONE_TEMPLATE_SUFFIXES]
+ZONE_LATE_COLUMNS = [f"zone_ld_{suffix}" for suffix in ZONE_TEMPLATE_SUFFIXES]
+
+S3S4_RELATIVE_COLUMNS = [
+    "zone_ed_peak_rel_to_s2",
+    "zone_ed_mean_rel_to_s2",
+    "zone_ld_peak_rel_to_s1",
+    "zone_ld_mean_rel_to_s1",
+    "zone_md_peak_rel_to_s1s2_mean",
 ]
 
-RS_PEAK_PARAMETER_COLUMNS = [
-    "S1S_RS_Peak",
-    "S1E_RS_Peak",
-    "S2S_RS_Peak",
-    "S2E_RS_Peak",
+SHAPE_FEATURE_COLUMNS = [
+    "shape_s1_attack_ratio",
+    "shape_s1_decay_ratio",
+    "shape_s1_temporal_centroid_rel",
+    "shape_s2_attack_ratio",
+    "shape_s2_decay_ratio",
+    "shape_s2_temporal_centroid_rel",
 ]
 
-RS_WIDTH_PARAMETER_COLUMNS = [
-    "S1S_RS_Width_ms",
-    "S1E_RS_Width_ms",
-    "S2S_RS_Width_ms",
-    "S2E_RS_Width_ms",
+STAT_FEATURE_COLUMNS = [
+    "stat_cycle_zero_crossing_rate",
+    "stat_cycle_diff_mean_abs",
+    "stat_s1_skewness",
+    "stat_s1_kurtosis",
+    "stat_s2_skewness",
+    "stat_s2_kurtosis",
 ]
 
-RS_SUMATION_PARAMETER_COLUMNS = [
-    "S1S_RS_Sumation",
-    "S1E_RS_Sumation",
-    "S2S_RS_Sumation",
-    "S2E_RS_Sumation",
+STABILITY_FEATURE_COLUMNS = [
+    "stab_s1_template_corr",
+    "stab_s2_template_corr",
 ]
 
-HEART_RATE_COLUMNS = [
-    "HeartRate_bpm",
-]
+PRIMARY_FEATURE_GROUPS = {
+    "global": GLOBAL_FEATURE_COLUMNS,
+    "segment_s1": SEGMENT_S1_COLUMNS,
+    "segment_systole": SEGMENT_SYSTOLE_COLUMNS,
+    "segment_s2": SEGMENT_S2_COLUMNS,
+    "segment_diastole": SEGMENT_DIASTOLE_COLUMNS,
+    "zone_early_diastole": ZONE_EARLY_COLUMNS,
+    "zone_mid_diastole": ZONE_MID_COLUMNS,
+    "zone_late_diastole": ZONE_LATE_COLUMNS,
+    "s3s4_relative": S3S4_RELATIVE_COLUMNS,
+    "shape": SHAPE_FEATURE_COLUMNS,
+    "stat": STAT_FEATURE_COLUMNS,
+    "stability": STABILITY_FEATURE_COLUMNS,
+}
 
-ALL_FEATURE_COLUMNS = (
-    S1_PARAMETER_COLUMNS
-    + S2_PARAMETER_COLUMNS
-    + SYSTOLE_PARAMETER_COLUMNS
-    + DIASTOLE_PARAMETER_COLUMNS
-    + RS_PEAK_PARAMETER_COLUMNS
-    + RS_WIDTH_PARAMETER_COLUMNS
-    + RS_SUMATION_PARAMETER_COLUMNS
-    + HEART_RATE_COLUMNS
-)
+SECONDARY_FEATURE_GROUPS = {
+    "murmur_related": [
+        "seg_sys_energy",
+        "seg_sys_energy_ratio_to_cycle",
+        "seg_sys_energy_centroid",
+        "seg_sys_energy_spread",
+        "seg_sys_env_occupancy",
+    ],
+}
 
-SUMMARY_SOURCE_COLUMNS = [
-    "S1_Width_ms",
-    "S2_Width_ms",
-    "Systole_Duration_ms",
-    "Diastole_Duration_ms",
-    "HeartRate_bpm",
-    "S1_Peak_mV",
-    "S2_Peak_mV",
-]
+FEATURE_GROUPS = {**PRIMARY_FEATURE_GROUPS, **SECONDARY_FEATURE_GROUPS}
+
+ALL_FEATURE_COLUMNS: list[str] = []
+for group_columns in PRIMARY_FEATURE_GROUPS.values():
+    for column in group_columns:
+        if column not in ALL_FEATURE_COLUMNS:
+            ALL_FEATURE_COLUMNS.append(column)
 
 METADATA_COLUMNS = [
     "record_id",
@@ -174,12 +213,14 @@ METADATA_COLUMNS = [
     "cycle_index",
     "valid_flag",
     "invalid_reason",
-    "S1_start",
-    "S1_end",
-    "S2_start",
-    "S2_end",
-    "next_S1_start",
-    "next_S1_end",
+    "s1_start",
+    "s1_end",
+    "s2_start",
+    "s2_end",
+    "next_s1_start",
+    "next_s1_end",
+    "cycle_start",
+    "cycle_end",
     "s1_on",
     "s1_off",
     "s2_on",
@@ -193,6 +234,11 @@ EVENT_COLUMN_MAP = {
     "S2_start": "S2-Start_RS_Score",
     "S2_end": "S2-End_RS_Score",
 }
+
+
+# =================================================
+# 2. File IO Helpers
+# =================================================
 
 
 def parse_record_id(file_path: Path) -> str:
@@ -260,6 +306,11 @@ def load_recording_table(file_path: Path, expected_columns: list[str]) -> pd.Dat
 
     logger.info("파일 로드 완료: %s, num_rows=%s", file_path.name, len(dataframe))
     return dataframe
+
+
+# =================================================
+# 3. Cycle Detection Helpers
+# =================================================
 
 
 def _extract_threshold_peaks(values: np.ndarray, threshold: float) -> list[tuple[int, float]]:
@@ -382,14 +433,6 @@ def _resolve_region_overlaps(
     return resolved_first, resolved_second
 
 
-def _nan_feature_map() -> dict[str, float]:
-    return {column: float(np.nan) for column in ALL_FEATURE_COLUMNS}
-
-
-def _nan_row(columns: list[str]) -> dict[str, float]:
-    return {column: float(np.nan) for column in columns}
-
-
 def _is_valid_cycle_order(
     s1_start: int | float | None,
     s1_end: int | float | None,
@@ -413,24 +456,24 @@ def _is_valid_cycle_order(
 
 
 def _validate_cycle_boundaries(cycle_row: dict[str, Any], signal_length: int) -> tuple[bool, str]:
-    required_columns = ["S1_start", "S1_end", "S2_start", "S2_end", "next_S1_start"]
+    required_columns = ["s1_start", "s1_end", "s2_start", "s2_end", "next_s1_start"]
     if any(pd.isna(cycle_row[column]) for column in required_columns):
         return False, "missing_boundary"
 
     if not _is_valid_cycle_order(
-        cycle_row["S1_start"],
-        cycle_row["S1_end"],
-        cycle_row["S2_start"],
-        cycle_row["S2_end"],
-        cycle_row["next_S1_start"],
+        cycle_row["s1_start"],
+        cycle_row["s1_end"],
+        cycle_row["s2_start"],
+        cycle_row["s2_end"],
+        cycle_row["next_s1_start"],
     ):
         return False, "invalid_cycle_order"
 
-    s1_start = int(cycle_row["S1_start"])
-    s1_end = int(cycle_row["S1_end"])
-    s2_start = int(cycle_row["S2_start"])
-    s2_end = int(cycle_row["S2_end"])
-    next_s1_start = int(cycle_row["next_S1_start"])
+    s1_start = int(cycle_row["s1_start"])
+    s1_end = int(cycle_row["s1_end"])
+    s2_start = int(cycle_row["s2_start"])
+    s2_end = int(cycle_row["s2_end"])
+    next_s1_start = int(cycle_row["next_s1_start"])
     if not (0 <= s1_start < s1_end < s2_start < s2_end < next_s1_start <= signal_length):
         return False, "out_of_bounds"
 
@@ -491,12 +534,14 @@ def _build_cycles_from_recording(recording_table: pd.DataFrame) -> list[dict[str
             {
                 "cycle_index": cycle_index,
                 "beat_index": cycle_index - 1,
-                "S1_start": s1_start,
-                "S1_end": s1_end,
-                "S2_start": s2_start,
-                "S2_end": s2_end,
-                "next_S1_start": next_s1_start,
-                "next_S1_end": next_s1_end,
+                "s1_start": s1_start,
+                "s1_end": s1_end,
+                "s2_start": s2_start,
+                "s2_end": s2_end,
+                "next_s1_start": next_s1_start,
+                "next_s1_end": next_s1_end,
+                "cycle_start": s1_start,
+                "cycle_end": next_s1_start,
                 "s1_on": s1_start,
                 "s1_off": s1_end,
                 "s2_on": s2_start,
@@ -508,362 +553,385 @@ def _build_cycles_from_recording(recording_table: pd.DataFrame) -> list[dict[str
     return rows
 
 
-def _compute_sound_parameter_row(
-    amplitude: np.ndarray,
-    start_index: int,
-    end_index: int,
-    *,
-    width_key: str,
-    peak_key: str,
-    mean_key: str,
-    rms_key: str,
-    area_key: str,
-    sumation_key: str,
-    nan_factory: Callable[[], dict[str, float]],
-) -> dict[str, float]:
-    safe_start = max(0, int(start_index))
-    safe_end = min(len(amplitude), int(end_index))
-    if safe_start >= safe_end or amplitude.size == 0:
-        return nan_factory()
-
-    segment = amplitude[safe_start:safe_end].astype(float, copy=False)
-    if segment.size == 0:
-        return nan_factory()
-
-    absolute_segment = np.abs(segment)
-    total_absolute = float(np.sum(absolute_segment))
-    peak_value = float(np.max(absolute_segment))
-    sumation_value = float(peak_value / total_absolute) if total_absolute > 0.0 else float(np.nan)
-
-    return {
-        width_key: float((safe_end - safe_start) * PreprocessConfig.SAMPLE_MS),
-        peak_key: peak_value,
-        mean_key: float(np.mean(absolute_segment)),
-        rms_key: float(np.sqrt(np.mean(segment ** 2))),
-        area_key: float(np.sum(absolute_segment) * PreprocessConfig.SAMPLE_MS),
-        sumation_key: sumation_value,
-    }
+# =================================================
+# 4. Numeric Helpers
+# =================================================
 
 
-def _compute_s1_parameter_row(amplitude: np.ndarray, start_index: int, end_index: int) -> dict[str, float]:
-    return _compute_sound_parameter_row(
-        amplitude,
-        start_index,
-        end_index,
-        width_key="S1_Width_ms",
-        peak_key="S1_Peak_mV",
-        mean_key="S1_mean_mV",
-        rms_key="S1_RMS_mV",
-        area_key="S1_Area_mVms",
-        sumation_key="S1_Sumation",
-        nan_factory=lambda: _nan_row(S1_PARAMETER_COLUMNS),
-    )
+def _safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    if not np.isfinite(numerator) or not np.isfinite(denominator) or abs(denominator) <= PreprocessConfig.EPS:
+        return float(default)
+    return float(numerator / denominator)
 
 
-def _compute_s2_parameter_row(amplitude: np.ndarray, start_index: int, end_index: int) -> dict[str, float]:
-    return _compute_sound_parameter_row(
-        amplitude,
-        start_index,
-        end_index,
-        width_key="S2_Width_ms",
-        peak_key="S2_Peak_mV",
-        mean_key="S2_mean_mV",
-        rms_key="S2_RMS_mV",
-        area_key="S2_Area_mVms",
-        sumation_key="S2_Sumation",
-        nan_factory=lambda: _nan_row(S2_PARAMETER_COLUMNS),
-    )
+def _nan_feature_map() -> dict[str, float]:
+    return {column: float(np.nan) for column in ALL_FEATURE_COLUMNS}
 
 
-def _compute_gap_parameter_row(
-    amplitude: np.ndarray,
-    *,
-    start_index: int,
-    end_index: int,
-    duration_key: str,
-    peak_key: str,
-    mean_key: str,
-    nan_factory: Callable[[], dict[str, float]],
-) -> dict[str, float]:
-    safe_start = max(0, int(start_index))
-    safe_end = min(len(amplitude), int(end_index))
-    if amplitude.size == 0 or safe_start >= safe_end:
-        return nan_factory()
-
-    segment = amplitude[safe_start:safe_end].astype(float, copy=False)
-    if segment.size == 0:
-        return nan_factory()
-
-    absolute_segment = np.abs(segment)
-    return {
-        duration_key: float((safe_end - safe_start) * PreprocessConfig.SAMPLE_MS),
-        peak_key: float(np.max(absolute_segment)),
-        mean_key: float(np.mean(absolute_segment)),
-    }
-
-
-def _compute_systole_parameter_row(
-    amplitude: np.ndarray,
-    s1_end_index: int,
-    s2_start_index: int,
-) -> dict[str, float]:
-    return _compute_gap_parameter_row(
-        amplitude,
-        start_index=s1_end_index,
-        end_index=s2_start_index,
-        duration_key="Systole_Duration_ms",
-        peak_key="Systole_Peak_mV",
-        mean_key="Systole_mean_mV",
-        nan_factory=lambda: _nan_row(SYSTOLE_PARAMETER_COLUMNS),
-    )
+def _nan_row(columns: list[str]) -> dict[str, float]:
+    return {column: float(np.nan) for column in columns}
 
 
 def _ms_to_sample_count(duration_ms: float) -> int:
     return max(1, int(round(duration_ms / PreprocessConfig.SAMPLE_MS)))
 
 
-def _resolve_diastolic_expected_window(
-    window_kind: str,
-    diastole_start: int,
-    diastole_end: int,
-    current_s2_end: int,
-    next_s1_start: int,
-) -> tuple[int, int] | None:
-    if diastole_end <= diastole_start:
-        return None
-
-    diastolic_length = diastole_end - diastole_start
-    minimum_window_length = _ms_to_sample_count(
-        PreprocessConfig.DIASTOLIC_WINDOW_MIN_DURATION_MS * PreprocessConfig.CANDIDATE_MIN_WINDOW_MULTIPLIER
-    )
-    config = PreprocessConfig.S3_WINDOW_CONFIG if window_kind == "S3" else PreprocessConfig.S4_WINDOW_CONFIG
-
-    if window_kind == "S3":
-        default_start = current_s2_end + _ms_to_sample_count(float(config["offset_start_ms"]))
-        default_end = current_s2_end + _ms_to_sample_count(float(config["offset_end_ms"]))
-    else:
-        default_start = next_s1_start - _ms_to_sample_count(float(config["offset_start_ms"]))
-        default_end = next_s1_start - _ms_to_sample_count(float(config["offset_end_ms"]))
-
-    clipped_default_start = max(diastole_start, min(default_start, diastole_end))
-    clipped_default_end = max(clipped_default_start, min(default_end, diastole_end))
-    if clipped_default_end - clipped_default_start >= minimum_window_length:
-        return clipped_default_start, clipped_default_end
-
-    fallback_start = diastole_start + int(diastolic_length * float(config["fallback_start_ratio"]))
-    fallback_end = diastole_start + int(diastolic_length * float(config["fallback_end_ratio"]))
-    clipped_fallback_start = max(diastole_start, min(fallback_start, diastole_end))
-    clipped_fallback_end = max(clipped_fallback_start, min(fallback_end, diastole_end))
-    if clipped_fallback_end - clipped_fallback_start < minimum_window_length:
-        return None
-
-    return clipped_fallback_start, clipped_fallback_end
+def _moving_average(values: np.ndarray, radius: int) -> np.ndarray:
+    if values.size == 0:
+        return np.array([], dtype=np.float32)
+    safe_radius = max(1, int(radius))
+    prefix = np.zeros(values.size + 1, dtype=np.float64)
+    prefix[1:] = np.cumsum(values, dtype=np.float64)
+    smoothed = np.zeros(values.size, dtype=np.float32)
+    for index in range(values.size):
+        start = max(0, index - safe_radius)
+        end = min(values.size - 1, index + safe_radius)
+        total = prefix[end + 1] - prefix[start]
+        smoothed[index] = float(total / max(1, end - start + 1))
+    return smoothed
 
 
-def _compute_segment_delta_value(amplitude: np.ndarray, start_index: int, end_index: int) -> float:
+def _build_smoothed_envelope(amplitude: np.ndarray) -> np.ndarray:
+    abs_amplitude = np.abs(np.nan_to_num(amplitude.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0))
+    radius = _ms_to_sample_count(PreprocessConfig.ENVELOPE_SMOOTH_MS) // 2
+    return _moving_average(abs_amplitude, radius=max(1, radius))
+
+
+def _slice_signal(signal: np.ndarray, start_index: int, end_index: int) -> np.ndarray:
     safe_start = max(0, int(start_index))
-    safe_end = min(len(amplitude), int(end_index))
-    if amplitude.size == 0 or safe_end - safe_start < 2:
-        return float(np.nan)
+    safe_end = min(len(signal), int(end_index))
+    if safe_start >= safe_end:
+        return np.array([], dtype=np.float32)
+    return signal[safe_start:safe_end].astype(np.float32, copy=False)
 
-    segment = np.nan_to_num(amplitude[safe_start:safe_end].astype(float, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
+def _resample_vector(values: np.ndarray, target_points: int) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros(target_points, dtype=np.float32)
+    if values.size == 1:
+        return np.repeat(values.astype(np.float32), target_points)
+    source_positions = np.linspace(0.0, 1.0, values.size, dtype=np.float64)
+    target_positions = np.linspace(0.0, 1.0, target_points, dtype=np.float64)
+    return np.interp(target_positions, source_positions, values.astype(np.float64)).astype(np.float32)
+
+
+def _zscore_vector(values: np.ndarray) -> np.ndarray:
+    values = values.astype(np.float32, copy=False)
+    mean_value = float(np.mean(values)) if values.size > 0 else 0.0
+    std_value = float(np.std(values, ddof=0)) if values.size > 0 else 0.0
+    if std_value <= PreprocessConfig.EPS:
+        return np.zeros_like(values, dtype=np.float32)
+    return ((values - mean_value) / std_value).astype(np.float32)
+
+
+def _safe_weighted_centroid(weights: np.ndarray) -> float:
+    if weights.size == 0:
+        return 0.5
+    total_weight = float(np.sum(weights))
+    if total_weight <= PreprocessConfig.EPS:
+        return 0.5
+    positions = np.linspace(0.0, 1.0, weights.size, dtype=np.float64)
+    return float(np.sum(positions * weights) / total_weight)
+
+
+def _safe_weighted_spread(weights: np.ndarray, centroid: float) -> float:
+    if weights.size == 0:
+        return 0.0
+    total_weight = float(np.sum(weights))
+    if total_weight <= PreprocessConfig.EPS:
+        return 0.0
+    positions = np.linspace(0.0, 1.0, weights.size, dtype=np.float64)
+    variance = float(np.sum(((positions - centroid) ** 2) * weights) / total_weight)
+    return float(np.sqrt(max(variance, 0.0)))
+
+
+def _safe_peak_timing_relative(values: np.ndarray) -> float:
+    if values.size <= 1:
+        return 0.5
+    peak_index = int(np.argmax(values))
+    return float(peak_index / max(1, values.size - 1))
+
+
+def _safe_skewness(values: np.ndarray) -> float:
+    if values.size < 3:
+        return 0.0
+    mean_value = float(np.mean(values))
+    std_value = float(np.std(values, ddof=0))
+    if std_value <= PreprocessConfig.EPS:
+        return 0.0
+    z_values = (values - mean_value) / std_value
+    return float(np.mean(z_values ** 3))
+
+
+def _safe_kurtosis(values: np.ndarray) -> float:
+    if values.size < 4:
+        return 0.0
+    mean_value = float(np.mean(values))
+    std_value = float(np.std(values, ddof=0))
+    if std_value <= PreprocessConfig.EPS:
+        return 0.0
+    z_values = (values - mean_value) / std_value
+    return float(np.mean(z_values ** 4) - 3.0)
+
+
+def _safe_zero_crossing_rate(values: np.ndarray) -> float:
+    if values.size < 2:
+        return 0.0
+    signs = np.sign(values)
+    transitions = np.sum(signs[1:] * signs[:-1] < 0)
+    return float(transitions / max(1, values.size - 1))
+
+
+def _safe_diff_mean_abs(values: np.ndarray) -> float:
+    if values.size < 2:
+        return 0.0
+    return float(np.mean(np.abs(np.diff(values))))
+
+
+# =================================================
+# 5. Template Helpers
+# =================================================
+
+
+def _build_segment_template(
+    envelope: np.ndarray,
+    cycle_rows: list[dict[str, Any]],
+    start_key: str,
+    end_key: str,
+) -> np.ndarray | None:
+    template_vectors: list[np.ndarray] = []
+    for cycle_row in cycle_rows:
+        start_index = int(cycle_row[start_key])
+        end_index = int(cycle_row[end_key])
+        segment = _slice_signal(envelope, start_index, end_index)
+        if segment.size < 2:
+            continue
+        resampled = _resample_vector(segment, PreprocessConfig.TEMPLATE_RESAMPLE_POINTS)
+        template_vectors.append(_zscore_vector(resampled))
+
+    if len(template_vectors) < PreprocessConfig.TEMPLATE_MIN_VALID_SEGMENTS:
+        return None
+
+    stacked = np.stack(template_vectors, axis=0)
+    return np.mean(stacked, axis=0).astype(np.float32)
+
+
+def _compute_template_correlation(
+    envelope: np.ndarray,
+    start_index: int,
+    end_index: int,
+    template: np.ndarray | None,
+) -> float:
+    if template is None:
+        return 0.0
+    segment = _slice_signal(envelope, start_index, end_index)
     if segment.size < 2:
-        return float(np.nan)
+        return 0.0
+    resampled = _zscore_vector(_resample_vector(segment, len(template)))
+    template_z = _zscore_vector(template)
+    correlation = float(np.mean(resampled * template_z))
+    if not np.isfinite(correlation):
+        return 0.0
+    return correlation
 
-    return float(np.mean(np.abs(np.diff(segment))))
+
+# =================================================
+# 6. Feature Computation Helpers
+# =================================================
 
 
-def _compute_diastolic_expected_delta_row(
-    amplitude: np.ndarray,
-    s2_end_index: int,
-    next_s1_start_index: int,
+def _compute_global_features(
+    cycle_raw: np.ndarray,
+    cycle_env: np.ndarray,
+    s1_duration_samples: int,
+    s2_duration_samples: int,
+    systole_duration_samples: int,
+    diastole_duration_samples: int,
 ) -> dict[str, float]:
-    diastole_start = int(s2_end_index) + 1
-    diastole_end = int(next_s1_start_index) - 1
-    if diastole_end <= diastole_start:
+    cycle_length_samples = int(cycle_raw.size)
+    cycle_length_ms = float(cycle_length_samples * PreprocessConfig.SAMPLE_MS)
+    cycle_energy = float(np.sum(cycle_env.astype(np.float64) ** 2))
+    cycle_hr = _safe_divide(60000.0, cycle_length_ms, default=0.0)
+
+    return {
+        "global_cycle_length_ms": cycle_length_ms,
+        "global_hr_bpm": cycle_hr,
+        "global_s1_width_ratio": _safe_divide(float(s1_duration_samples), float(cycle_length_samples)),
+        "global_s2_width_ratio": _safe_divide(float(s2_duration_samples), float(cycle_length_samples)),
+        "global_systole_ratio": _safe_divide(float(systole_duration_samples), float(cycle_length_samples)),
+        "global_diastole_ratio": _safe_divide(float(diastole_duration_samples), float(cycle_length_samples)),
+        "global_total_energy": cycle_energy,
+        "global_env_mean": float(np.mean(cycle_env)) if cycle_env.size > 0 else 0.0,
+        "global_env_peak": float(np.max(cycle_env)) if cycle_env.size > 0 else 0.0,
+        "global_env_rms": float(np.sqrt(np.mean(cycle_env.astype(np.float64) ** 2))) if cycle_env.size > 0 else 0.0,
+    }
+
+
+def _compute_segment_block(
+    prefix: str,
+    raw_signal: np.ndarray,
+    env_signal: np.ndarray,
+    cycle_energy: float,
+    *,
+    ratio_key: str,
+) -> dict[str, float]:
+    if raw_signal.size == 0 or env_signal.size == 0:
         return {
-            "Diastole_S3_Expected_Delta_mV": float(np.nan),
-            "Diastole_NaN_Gap_Delta_mV": float(np.nan),
-            "Diastole_S4_Expected_Delta_mV": float(np.nan),
+            f"{prefix}_duration_ms": 0.0,
+            f"{prefix}_mean_env": 0.0,
+            f"{prefix}_peak_env": 0.0,
+            f"{prefix}_rms": 0.0,
+            f"{prefix}_energy": 0.0,
+            f"{prefix}_{ratio_key}": 0.0,
+            f"{prefix}_energy_centroid": 0.5,
+            f"{prefix}_energy_spread": 0.0,
+            f"{prefix}_env_occupancy": 0.0,
         }
 
-    s3_window = _resolve_diastolic_expected_window(
-        "S3",
-        diastole_start,
-        diastole_end,
-        int(s2_end_index),
-        int(next_s1_start_index),
-    )
-    s4_window = _resolve_diastolic_expected_window(
-        "S4",
-        diastole_start,
-        diastole_end,
-        int(s2_end_index),
-        int(next_s1_start_index),
-    )
-
-    nan_gap_delta = float(np.nan)
-    if s3_window is not None and s4_window is not None:
-        gap_start = int(s3_window[1])
-        gap_end = int(s4_window[0])
-        if gap_end - gap_start >= 2:
-            nan_gap_delta = _compute_segment_delta_value(amplitude, gap_start, gap_end)
+    env_energy_weights = env_signal.astype(np.float64) ** 2
+    peak_env = float(np.max(env_signal))
+    occupancy_threshold = peak_env * PreprocessConfig.ENVELOPE_OCCUPANCY_THRESHOLD_RATIO
+    occupancy = float(np.mean(env_signal >= occupancy_threshold)) if peak_env > PreprocessConfig.EPS else 0.0
+    centroid = _safe_weighted_centroid(env_energy_weights)
+    spread = _safe_weighted_spread(env_energy_weights, centroid)
+    energy_value = float(np.sum(env_energy_weights))
 
     return {
-        "Diastole_S3_Expected_Delta_mV": _compute_segment_delta_value(amplitude, *s3_window)
-        if s3_window is not None
-        else float(np.nan),
-        "Diastole_NaN_Gap_Delta_mV": nan_gap_delta,
-        "Diastole_S4_Expected_Delta_mV": _compute_segment_delta_value(amplitude, *s4_window)
-        if s4_window is not None
-        else float(np.nan),
+        f"{prefix}_duration_ms": float(raw_signal.size * PreprocessConfig.SAMPLE_MS),
+        f"{prefix}_mean_env": float(np.mean(env_signal)),
+        f"{prefix}_peak_env": peak_env,
+        f"{prefix}_rms": float(np.sqrt(np.mean(raw_signal.astype(np.float64) ** 2))),
+        f"{prefix}_energy": energy_value,
+        f"{prefix}_{ratio_key}": _safe_divide(energy_value, cycle_energy if ratio_key == "energy_ratio_to_cycle" else cycle_energy),
+        f"{prefix}_energy_centroid": centroid,
+        f"{prefix}_energy_spread": spread,
+        f"{prefix}_env_occupancy": occupancy,
     }
 
 
-def _compute_diastole_parameter_row(
-    amplitude: np.ndarray,
-    s2_end_index: int,
-    next_s1_start_index: int,
+def _compute_zone_block(
+    prefix: str,
+    raw_signal: np.ndarray,
+    env_signal: np.ndarray,
+    diastole_energy: float,
 ) -> dict[str, float]:
-    row = _compute_gap_parameter_row(
-        amplitude,
-        start_index=s2_end_index,
-        end_index=next_s1_start_index,
-        duration_key="Diastole_Duration_ms",
-        peak_key="Diastole_Peak_mV",
-        mean_key="Diastole_mean_mV",
-        nan_factory=lambda: _nan_row(DIASTOLE_PARAMETER_COLUMNS),
-    )
-    row.update(_compute_diastolic_expected_delta_row(amplitude, s2_end_index, next_s1_start_index))
-    return row
+    if raw_signal.size == 0 or env_signal.size == 0:
+        return {
+            f"{prefix}_duration_ms": 0.0,
+            f"{prefix}_mean_env": 0.0,
+            f"{prefix}_peak_env": 0.0,
+            f"{prefix}_rms": 0.0,
+            f"{prefix}_energy": 0.0,
+            f"{prefix}_energy_ratio_to_diastole": 0.0,
+            f"{prefix}_peak_timing_relative": 0.5,
+            f"{prefix}_energy_centroid": 0.5,
+            f"{prefix}_energy_spread": 0.0,
+            f"{prefix}_env_occupancy": 0.0,
+        }
+
+    env_energy_weights = env_signal.astype(np.float64) ** 2
+    peak_env = float(np.max(env_signal))
+    occupancy_threshold = peak_env * PreprocessConfig.ENVELOPE_OCCUPANCY_THRESHOLD_RATIO
+    occupancy = float(np.mean(env_signal >= occupancy_threshold)) if peak_env > PreprocessConfig.EPS else 0.0
+    centroid = _safe_weighted_centroid(env_energy_weights)
+    spread = _safe_weighted_spread(env_energy_weights, centroid)
+    energy_value = float(np.sum(env_energy_weights))
+
+    return {
+        f"{prefix}_duration_ms": float(raw_signal.size * PreprocessConfig.SAMPLE_MS),
+        f"{prefix}_mean_env": float(np.mean(env_signal)),
+        f"{prefix}_peak_env": peak_env,
+        f"{prefix}_rms": float(np.sqrt(np.mean(raw_signal.astype(np.float64) ** 2))),
+        f"{prefix}_energy": energy_value,
+        f"{prefix}_energy_ratio_to_diastole": _safe_divide(energy_value, diastole_energy),
+        f"{prefix}_peak_timing_relative": _safe_peak_timing_relative(env_signal),
+        f"{prefix}_energy_centroid": centroid,
+        f"{prefix}_energy_spread": spread,
+        f"{prefix}_env_occupancy": occupancy,
+    }
 
 
-def _get_rs_peak_value(signal: np.ndarray, event_index: int | None) -> float:
-    if event_index is None:
-        return float(np.nan)
+def _compute_shape_features(s1_env: np.ndarray, s2_env: np.ndarray) -> dict[str, float]:
+    s1_attack = _safe_peak_timing_relative(s1_env)
+    s2_attack = _safe_peak_timing_relative(s2_env)
 
-    safe_index = int(event_index)
-    if safe_index < 0 or safe_index >= len(signal):
-        return float(np.nan)
-
-    value = float(signal[safe_index])
-    if not np.isfinite(value):
-        return float(np.nan)
-    return float(int(round(value)))
-
-
-def _get_rs_width_bounds(signal: np.ndarray, event_index: int | None) -> tuple[int, int] | None:
-    if event_index is None:
-        return None
-
-    safe_index = int(event_index)
-    if safe_index < 0 or safe_index >= len(signal):
-        return None
-
-    peak_value = float(signal[safe_index])
-    if not np.isfinite(peak_value) or peak_value <= 0.0:
-        return None
-
-    threshold = 0.5 * peak_value
-    left_index = safe_index
-    while left_index - 1 >= 0:
-        next_value = float(signal[left_index - 1])
-        if not np.isfinite(next_value) or next_value < threshold:
-            break
-        left_index -= 1
-
-    right_index = safe_index
-    while right_index + 1 < len(signal):
-        next_value = float(signal[right_index + 1])
-        if not np.isfinite(next_value) or next_value < threshold:
-            break
-        right_index += 1
-
-    if left_index > right_index:
-        return None
-
-    return left_index, right_index
+    return {
+        "shape_s1_attack_ratio": s1_attack,
+        "shape_s1_decay_ratio": float(max(0.0, 1.0 - s1_attack)),
+        "shape_s1_temporal_centroid_rel": _safe_weighted_centroid(s1_env.astype(np.float64) ** 2),
+        "shape_s2_attack_ratio": s2_attack,
+        "shape_s2_decay_ratio": float(max(0.0, 1.0 - s2_attack)),
+        "shape_s2_temporal_centroid_rel": _safe_weighted_centroid(s2_env.astype(np.float64) ** 2),
+    }
 
 
-def _get_rs_width_value(signal: np.ndarray, event_index: int | None) -> float:
-    bounds = _get_rs_width_bounds(signal, event_index)
-    if bounds is None:
-        return float(np.nan)
-
-    left_index, right_index = bounds
-    return float((right_index - left_index) * PreprocessConfig.SAMPLE_MS)
-
-
-def _get_rs_sumation_value(signal: np.ndarray, event_index: int | None) -> float:
-    bounds = _get_rs_width_bounds(signal, event_index)
-    if bounds is None:
-        return float(np.nan)
-
-    safe_index = int(event_index) if event_index is not None else -1
-    if safe_index < 0 or safe_index >= len(signal):
-        return float(np.nan)
-
-    left_index, right_index = bounds
-    segment = np.nan_to_num(signal[left_index : right_index + 1].astype(float, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
-    total = float(np.sum(np.abs(segment)))
-    peak_value = float(signal[safe_index])
-    if total <= 0.0 or not np.isfinite(peak_value):
-        return float(np.nan)
-    return float(abs(peak_value) / total)
+def _compute_stat_features(cycle_raw: np.ndarray, s1_raw: np.ndarray, s2_raw: np.ndarray) -> dict[str, float]:
+    return {
+        "stat_cycle_zero_crossing_rate": _safe_zero_crossing_rate(cycle_raw),
+        "stat_cycle_diff_mean_abs": _safe_diff_mean_abs(cycle_raw),
+        "stat_s1_skewness": _safe_skewness(s1_raw.astype(np.float64)),
+        "stat_s1_kurtosis": _safe_kurtosis(s1_raw.astype(np.float64)),
+        "stat_s2_skewness": _safe_skewness(s2_raw.astype(np.float64)),
+        "stat_s2_kurtosis": _safe_kurtosis(s2_raw.astype(np.float64)),
+    }
 
 
-def _compute_rs_peak_parameter_row(
-    s1_start_signal: np.ndarray,
-    s1_end_signal: np.ndarray,
-    s2_start_signal: np.ndarray,
-    s2_end_signal: np.ndarray,
+def _resolve_relative_zone_bounds(start_index: int, end_index: int, ratio_range: tuple[float, float]) -> tuple[int, int]:
+    safe_start = int(start_index)
+    safe_end = int(end_index)
+    if safe_end <= safe_start:
+        return safe_start, safe_start
+
+    length = safe_end - safe_start
+    left_ratio, right_ratio = ratio_range
+    zone_start = safe_start + int(np.floor(length * left_ratio))
+    zone_end = safe_start + int(np.floor(length * right_ratio))
+    zone_start = max(safe_start, min(zone_start, safe_end))
+    zone_end = max(zone_start, min(zone_end, safe_end))
+    return zone_start, zone_end
+
+
+def _compute_relative_features(
+    zone_ed_block: dict[str, float],
+    zone_md_block: dict[str, float],
+    zone_ld_block: dict[str, float],
+    seg_s1_block: dict[str, float],
+    seg_s2_block: dict[str, float],
+) -> dict[str, float]:
+    s1_peak_env = float(seg_s1_block["seg_s1_peak_env"])
+    s1_mean_env = float(seg_s1_block["seg_s1_mean_env"])
+    s2_peak_env = float(seg_s2_block["seg_s2_peak_env"])
+    s2_mean_env = float(seg_s2_block["seg_s2_mean_env"])
+    s1s2_mean_peak = float(np.mean([s1_peak_env, s2_peak_env]))
+
+    return {
+        "zone_ed_peak_rel_to_s2": _safe_divide(float(zone_ed_block["zone_ed_peak_env"]), s2_peak_env),
+        "zone_ed_mean_rel_to_s2": _safe_divide(float(zone_ed_block["zone_ed_mean_env"]), s2_mean_env),
+        "zone_ld_peak_rel_to_s1": _safe_divide(float(zone_ld_block["zone_ld_peak_env"]), s1_peak_env),
+        "zone_ld_mean_rel_to_s1": _safe_divide(float(zone_ld_block["zone_ld_mean_env"]), s1_mean_env),
+        "zone_md_peak_rel_to_s1s2_mean": _safe_divide(float(zone_md_block["zone_md_peak_env"]), s1s2_mean_peak),
+    }
+
+
+def _compute_stability_features(
+    envelope: np.ndarray,
     cycle_row: dict[str, Any],
+    s1_template: np.ndarray | None,
+    s2_template: np.ndarray | None,
 ) -> dict[str, float]:
     return {
-        "S1S_RS_Peak": _get_rs_peak_value(s1_start_signal, int(cycle_row["S1_start"])),
-        "S1E_RS_Peak": _get_rs_peak_value(s1_end_signal, int(cycle_row["S1_end"])),
-        "S2S_RS_Peak": _get_rs_peak_value(s2_start_signal, int(cycle_row["S2_start"])),
-        "S2E_RS_Peak": _get_rs_peak_value(s2_end_signal, int(cycle_row["S2_end"])),
-    }
-
-
-def _compute_rs_width_parameter_row(
-    s1_start_signal: np.ndarray,
-    s1_end_signal: np.ndarray,
-    s2_start_signal: np.ndarray,
-    s2_end_signal: np.ndarray,
-    cycle_row: dict[str, Any],
-) -> dict[str, float]:
-    return {
-        "S1S_RS_Width_ms": _get_rs_width_value(s1_start_signal, int(cycle_row["S1_start"])),
-        "S1E_RS_Width_ms": _get_rs_width_value(s1_end_signal, int(cycle_row["S1_end"])),
-        "S2S_RS_Width_ms": _get_rs_width_value(s2_start_signal, int(cycle_row["S2_start"])),
-        "S2E_RS_Width_ms": _get_rs_width_value(s2_end_signal, int(cycle_row["S2_end"])),
-    }
-
-
-def _compute_rs_sumation_parameter_row(
-    s1_start_signal: np.ndarray,
-    s1_end_signal: np.ndarray,
-    s2_start_signal: np.ndarray,
-    s2_end_signal: np.ndarray,
-    cycle_row: dict[str, Any],
-) -> dict[str, float]:
-    return {
-        "S1S_RS_Sumation": _get_rs_sumation_value(s1_start_signal, int(cycle_row["S1_start"])),
-        "S1E_RS_Sumation": _get_rs_sumation_value(s1_end_signal, int(cycle_row["S1_end"])),
-        "S2S_RS_Sumation": _get_rs_sumation_value(s2_start_signal, int(cycle_row["S2_start"])),
-        "S2E_RS_Sumation": _get_rs_sumation_value(s2_end_signal, int(cycle_row["S2_end"])),
-    }
-
-
-def _compute_heart_rate_row(s1_start_index: int, next_s1_start_index: int) -> dict[str, float]:
-    cycle_duration_ms = float((int(next_s1_start_index) - int(s1_start_index)) * PreprocessConfig.SAMPLE_MS)
-    if cycle_duration_ms <= 0.0:
-        return _nan_row(HEART_RATE_COLUMNS)
-
-    return {
-        "HeartRate_bpm": float(60000.0 / cycle_duration_ms),
+        "stab_s1_template_corr": _compute_template_correlation(
+            envelope,
+            int(cycle_row["s1_start"]),
+            int(cycle_row["s1_end"]),
+            s1_template,
+        ),
+        "stab_s2_template_corr": _compute_template_correlation(
+            envelope,
+            int(cycle_row["s2_start"]),
+            int(cycle_row["s2_end"]),
+            s2_template,
+        ),
     }
 
 
@@ -872,12 +940,11 @@ def _build_feature_row(
     source_file: str,
     cycle_row: dict[str, Any],
     amplitude: np.ndarray,
-    s1_start_signal: np.ndarray,
-    s1_end_signal: np.ndarray,
-    s2_start_signal: np.ndarray,
-    s2_end_signal: np.ndarray,
+    envelope: np.ndarray,
     valid_flag: int,
     invalid_reason: str,
+    s1_template: np.ndarray | None,
+    s2_template: np.ndarray | None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "record_id": record_id,
@@ -886,12 +953,14 @@ def _build_feature_row(
         "cycle_index": int(cycle_row["cycle_index"]),
         "valid_flag": int(valid_flag),
         "invalid_reason": invalid_reason,
-        "S1_start": cycle_row["S1_start"],
-        "S1_end": cycle_row["S1_end"],
-        "S2_start": cycle_row["S2_start"],
-        "S2_end": cycle_row["S2_end"],
-        "next_S1_start": cycle_row["next_S1_start"],
-        "next_S1_end": cycle_row["next_S1_end"],
+        "s1_start": cycle_row["s1_start"],
+        "s1_end": cycle_row["s1_end"],
+        "s2_start": cycle_row["s2_start"],
+        "s2_end": cycle_row["s2_end"],
+        "next_s1_start": cycle_row["next_s1_start"],
+        "next_s1_end": cycle_row["next_s1_end"],
+        "cycle_start": cycle_row["cycle_start"],
+        "cycle_end": cycle_row["cycle_end"],
         "s1_on": cycle_row["s1_on"],
         "s1_off": cycle_row["s1_off"],
         "s2_on": cycle_row["s2_on"],
@@ -903,41 +972,128 @@ def _build_feature_row(
         row.update(_nan_feature_map())
         return row
 
-    features: dict[str, float] = {}
-    features.update(_compute_s1_parameter_row(amplitude, int(cycle_row["S1_start"]), int(cycle_row["S1_end"])))
-    features.update(_compute_s2_parameter_row(amplitude, int(cycle_row["S2_start"]), int(cycle_row["S2_end"])))
-    features.update(_compute_systole_parameter_row(amplitude, int(cycle_row["S1_end"]), int(cycle_row["S2_start"])))
-    features.update(_compute_diastole_parameter_row(amplitude, int(cycle_row["S2_end"]), int(cycle_row["next_S1_start"])))
-    features.update(
-        _compute_rs_peak_parameter_row(
-            s1_start_signal,
-            s1_end_signal,
-            s2_start_signal,
-            s2_end_signal,
-            cycle_row,
-        )
+    s1_start = int(cycle_row["s1_start"])
+    s1_end = int(cycle_row["s1_end"])
+    s2_start = int(cycle_row["s2_start"])
+    s2_end = int(cycle_row["s2_end"])
+    next_s1_start = int(cycle_row["next_s1_start"])
+
+    cycle_raw = _slice_signal(amplitude, s1_start, next_s1_start)
+    cycle_env = _slice_signal(envelope, s1_start, next_s1_start)
+    s1_raw = _slice_signal(amplitude, s1_start, s1_end)
+    s1_env = _slice_signal(envelope, s1_start, s1_end)
+    systole_raw = _slice_signal(amplitude, s1_end, s2_start)
+    systole_env = _slice_signal(envelope, s1_end, s2_start)
+    s2_raw = _slice_signal(amplitude, s2_start, s2_end)
+    s2_env = _slice_signal(envelope, s2_start, s2_end)
+    diastole_raw = _slice_signal(amplitude, s2_end, next_s1_start)
+    diastole_env = _slice_signal(envelope, s2_end, next_s1_start)
+
+    s1_duration_samples = max(0, s1_end - s1_start)
+    s2_duration_samples = max(0, s2_end - s2_start)
+    systole_duration_samples = max(0, s2_start - s1_end)
+    diastole_duration_samples = max(0, next_s1_start - s2_end)
+
+    global_block = _compute_global_features(
+        cycle_raw=cycle_raw,
+        cycle_env=cycle_env,
+        s1_duration_samples=s1_duration_samples,
+        s2_duration_samples=s2_duration_samples,
+        systole_duration_samples=systole_duration_samples,
+        diastole_duration_samples=diastole_duration_samples,
     )
-    features.update(
-        _compute_rs_width_parameter_row(
-            s1_start_signal,
-            s1_end_signal,
-            s2_start_signal,
-            s2_end_signal,
-            cycle_row,
-        )
+
+    cycle_energy = float(global_block["global_total_energy"])
+    seg_s1_block = _compute_segment_block(
+        "seg_s1",
+        s1_raw,
+        s1_env,
+        cycle_energy,
+        ratio_key="energy_ratio_to_cycle",
     )
-    features.update(
-        _compute_rs_sumation_parameter_row(
-            s1_start_signal,
-            s1_end_signal,
-            s2_start_signal,
-            s2_end_signal,
-            cycle_row,
-        )
+    seg_sys_block = _compute_segment_block(
+        "seg_sys",
+        systole_raw,
+        systole_env,
+        cycle_energy,
+        ratio_key="energy_ratio_to_cycle",
     )
-    features.update(_compute_heart_rate_row(int(cycle_row["S1_start"]), int(cycle_row["next_S1_start"])))
-    row.update(features)
+    seg_s2_block = _compute_segment_block(
+        "seg_s2",
+        s2_raw,
+        s2_env,
+        cycle_energy,
+        ratio_key="energy_ratio_to_cycle",
+    )
+    seg_dia_block = _compute_segment_block(
+        "seg_dia",
+        diastole_raw,
+        diastole_env,
+        cycle_energy,
+        ratio_key="energy_ratio_to_cycle",
+    )
+
+    diastole_energy = float(seg_dia_block["seg_dia_energy"])
+    ed_start, ed_end = _resolve_relative_zone_bounds(s2_end, next_s1_start, PreprocessConfig.EARLY_DIASTOLE_RATIO)
+    md_start, md_end = _resolve_relative_zone_bounds(s2_end, next_s1_start, PreprocessConfig.MID_DIASTOLE_RATIO)
+    ld_start, ld_end = _resolve_relative_zone_bounds(s2_end, next_s1_start, PreprocessConfig.LATE_DIASTOLE_RATIO)
+
+    zone_ed_block = _compute_zone_block(
+        "zone_ed",
+        _slice_signal(amplitude, ed_start, ed_end),
+        _slice_signal(envelope, ed_start, ed_end),
+        diastole_energy,
+    )
+    zone_md_block = _compute_zone_block(
+        "zone_md",
+        _slice_signal(amplitude, md_start, md_end),
+        _slice_signal(envelope, md_start, md_end),
+        diastole_energy,
+    )
+    zone_ld_block = _compute_zone_block(
+        "zone_ld",
+        _slice_signal(amplitude, ld_start, ld_end),
+        _slice_signal(envelope, ld_start, ld_end),
+        diastole_energy,
+    )
+
+    relative_block = _compute_relative_features(
+        zone_ed_block=zone_ed_block,
+        zone_md_block=zone_md_block,
+        zone_ld_block=zone_ld_block,
+        seg_s1_block=seg_s1_block,
+        seg_s2_block=seg_s2_block,
+    )
+    shape_block = _compute_shape_features(s1_env=s1_env, s2_env=s2_env)
+    stat_block = _compute_stat_features(cycle_raw=cycle_raw, s1_raw=s1_raw, s2_raw=s2_raw)
+    stability_block = _compute_stability_features(
+        envelope=envelope,
+        cycle_row=cycle_row,
+        s1_template=s1_template,
+        s2_template=s2_template,
+    )
+
+    feature_row: dict[str, float] = {}
+    feature_row.update(global_block)
+    feature_row.update(seg_s1_block)
+    feature_row.update(seg_sys_block)
+    feature_row.update(seg_s2_block)
+    feature_row.update(seg_dia_block)
+    feature_row.update(zone_ed_block)
+    feature_row.update(zone_md_block)
+    feature_row.update(zone_ld_block)
+    feature_row.update(relative_block)
+    feature_row.update(shape_block)
+    feature_row.update(stat_block)
+    feature_row.update(stability_block)
+
+    row.update(feature_row)
     return row
+
+
+# =================================================
+# 7. Export Helpers
+# =================================================
 
 
 def build_feature_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
@@ -946,12 +1102,12 @@ def build_feature_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     missing_columns = [column for column in ordered_columns if column not in dataframe.columns]
     for column in missing_columns:
         dataframe[column] = np.nan
-    return dataframe[ordered_columns].copy()
+    return dataframe.loc[:, ordered_columns].copy()
 
 
-def summary_stat(values: np.ndarray, eps: float) -> dict[str, float]:
+def summary_stat(values: np.ndarray) -> dict[str, float]:
     values = np.asarray(values, dtype=np.float64)
-    values = values[~np.isnan(values)]
+    values = values[np.isfinite(values)]
     if values.size == 0:
         return {
             "mean": float(np.nan),
@@ -960,18 +1116,18 @@ def summary_stat(values: np.ndarray, eps: float) -> dict[str, float]:
             "rmssd": float(np.nan),
         }
 
-    std_value = float(np.std(values, ddof=0))
     mean_value = float(np.mean(values))
+    std_value = float(np.std(values, ddof=0))
     rmssd = float(np.sqrt(np.mean(np.square(np.diff(values))))) if values.size >= 2 else float(np.nan)
     return {
         "mean": mean_value,
         "std": std_value,
-        "cv": float(std_value / (mean_value + eps)),
+        "cv": _safe_divide(std_value, mean_value, default=float(np.nan)),
         "rmssd": rmssd,
     }
 
 
-def build_record_summary(feature_frame: pd.DataFrame, eps: float) -> pd.DataFrame:
+def build_record_summary(feature_frame: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for record_id, record_frame in feature_frame.groupby("record_id", sort=True):
         valid_frame = record_frame.loc[record_frame["valid_flag"] == 1].copy()
@@ -980,9 +1136,15 @@ def build_record_summary(feature_frame: pd.DataFrame, eps: float) -> pd.DataFram
             "total_cycles": int(len(record_frame)),
             "valid_cycles": int(len(valid_frame)),
             "invalid_cycles": int(len(record_frame) - len(valid_frame)),
+            "valid_ratio": _safe_divide(float(len(valid_frame)), float(max(1, len(record_frame)))),
+            "mean_feature_missing_fraction": float(
+                valid_frame.loc[:, ALL_FEATURE_COLUMNS].isnull().mean().mean()
+            )
+            if not valid_frame.empty
+            else float(np.nan),
         }
-        for column in SUMMARY_SOURCE_COLUMNS:
-            stats = summary_stat(valid_frame[column].to_numpy(dtype=np.float64), eps)
+        for column in PreprocessConfig.KEY_RECORD_SUMMARY_COLUMNS:
+            stats = summary_stat(valid_frame[column].to_numpy(dtype=np.float64))
             row[f"{column}_mean"] = stats["mean"]
             row[f"{column}_std"] = stats["std"]
             row[f"{column}_cv"] = stats["cv"]
@@ -995,6 +1157,56 @@ def build_learning_input_columns(feature_columns: list[str]) -> list[str]:
     return list(feature_columns)
 
 
+def build_preprocess_summary(
+    beat_features_all: pd.DataFrame,
+    beat_features_valid: pd.DataFrame,
+    feature_names: list[str],
+    feature_groups: dict[str, list[str]],
+) -> dict[str, Any]:
+    invalid_reason_counts = (
+        beat_features_all.loc[beat_features_all["valid_flag"] == 0, "invalid_reason"]
+        .fillna("unknown")
+        .value_counts()
+        .to_dict()
+    )
+    missingness_by_feature = beat_features_valid.loc[:, feature_names].isnull().mean().sort_values(ascending=False)
+    return {
+        "num_records": int(beat_features_all["record_id"].nunique()),
+        "total_cycles": int(len(beat_features_all)),
+        "valid_cycles": int(len(beat_features_valid)),
+        "invalid_cycles": int(len(beat_features_all) - len(beat_features_valid)),
+        "feature_dimension": int(len(feature_names)),
+        "group_feature_counts": {group_name: len(group_columns) for group_name, group_columns in feature_groups.items()},
+        "invalid_reason_counts": {str(key): int(value) for key, value in invalid_reason_counts.items()},
+        "mean_missing_fraction_valid": float(missingness_by_feature.mean()) if not missingness_by_feature.empty else 0.0,
+        "top_missing_features_valid": {
+            str(key): float(value)
+            for key, value in missingness_by_feature.head(10).to_dict().items()
+        },
+    }
+
+
+def _feature_groups_to_frame(feature_groups: dict[str, list[str]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for group_name, group_columns in feature_groups.items():
+        for order_index, feature_name in enumerate(group_columns):
+            rows.append(
+                {
+                    "feature_group": group_name,
+                    "feature_order": order_index,
+                    "feature_name": feature_name,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _summary_to_frame(summary: dict[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for key, value in summary.items():
+        rows.append({"key": key, "value": json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)})
+    return pd.DataFrame(rows)
+
+
 def export_feature_outputs(
     preprocess_root: Path,
     beat_features_all: pd.DataFrame,
@@ -1002,7 +1214,11 @@ def export_feature_outputs(
     record_summary: pd.DataFrame,
     feature_names: list[str],
     learning_input_columns: list[str],
+    feature_groups: dict[str, list[str]],
+    preprocess_summary: dict[str, Any],
 ) -> None:
+    preprocess_root.mkdir(parents=True, exist_ok=True)
+
     if PreprocessConfig.EXPORT_CSV:
         beat_features_all.to_csv(preprocess_root / "beat_features_all.csv", index=False)
         beat_features_valid.to_csv(preprocess_root / "beat_features_valid.csv", index=False)
@@ -1017,6 +1233,14 @@ def export_feature_outputs(
             json.dumps(learning_input_columns, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+        (preprocess_root / "feature_groups.json").write_text(
+            json.dumps(feature_groups, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        (preprocess_root / "preprocess_summary.json").write_text(
+            json.dumps(preprocess_summary, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     if PreprocessConfig.EXPORT_EXCEL:
         export_stage_workbook(
@@ -1025,6 +1249,8 @@ def export_feature_outputs(
                 "beat_features_all": beat_features_all,
                 "beat_features_valid": beat_features_valid,
                 "record_summary": record_summary,
+                "feature_groups": _feature_groups_to_frame(feature_groups),
+                "preprocess_summary": _summary_to_frame(preprocess_summary),
             },
             freeze_panes=PreprocessConfig.EXCEL_FREEZE_PANES,
             header_fill=PreprocessConfig.EXCEL_HEADER_FILL,
@@ -1035,19 +1261,30 @@ def export_feature_outputs(
     logger.info("export 경로: %s", preprocess_root)
 
 
+# =================================================
+# 8. Record Processing
+# =================================================
+
+
 def process_recording(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     record_id = parse_record_id(file_path)
     recording_table = load_recording_table(file_path, PreprocessConfig.EXPECTED_COLUMNS)
     amplitude = recording_table["Amplitude"].to_numpy(dtype=np.float32)
-    s1_start_signal = recording_table["S1-Start_RS_Score"].to_numpy(dtype=np.float32)
-    s1_end_signal = recording_table["S1-End_RS_Score"].to_numpy(dtype=np.float32)
-    s2_start_signal = recording_table["S2-Start_RS_Score"].to_numpy(dtype=np.float32)
-    s2_end_signal = recording_table["S2-End_RS_Score"].to_numpy(dtype=np.float32)
+    envelope = _build_smoothed_envelope(amplitude)
 
     cycles = _build_cycles_from_recording(recording_table)
     logger.info("cycle 수: record_id=%s, total_cycles=%s", record_id, len(cycles))
 
-    rows = []
+    valid_cycles_for_templates: list[dict[str, Any]] = []
+    for cycle_row in cycles:
+        is_valid, _ = _validate_cycle_boundaries(cycle_row, signal_length=len(amplitude))
+        if is_valid:
+            valid_cycles_for_templates.append(cycle_row)
+
+    s1_template = _build_segment_template(envelope, valid_cycles_for_templates, "s1_start", "s1_end")
+    s2_template = _build_segment_template(envelope, valid_cycles_for_templates, "s2_start", "s2_end")
+
+    rows: list[dict[str, Any]] = []
     valid_count = 0
     for cycle_row in cycles:
         is_valid, invalid_reason = _validate_cycle_boundaries(cycle_row, signal_length=len(amplitude))
@@ -1060,12 +1297,11 @@ def process_recording(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 source_file=file_path.name,
                 cycle_row=cycle_row,
                 amplitude=amplitude,
-                s1_start_signal=s1_start_signal,
-                s1_end_signal=s1_end_signal,
-                s2_start_signal=s2_start_signal,
-                s2_end_signal=s2_end_signal,
+                envelope=envelope,
                 valid_flag=valid_flag,
                 invalid_reason=invalid_reason,
+                s1_template=s1_template,
+                s2_template=s2_template,
             )
         )
 
@@ -1090,6 +1326,11 @@ def collect_input_files(data_root: Path, file_glob: str, supported_suffixes: tup
         and not path.name.startswith("~$")
         and path.suffix.lower() in supported_suffixes
     )
+
+
+# =================================================
+# 9. Main
+# =================================================
 
 
 def main() -> None:
@@ -1127,7 +1368,13 @@ def main() -> None:
 
     feature_names = list(ALL_FEATURE_COLUMNS)
     learning_input_columns = build_learning_input_columns(feature_names)
-    record_summary = build_record_summary(beat_features_all, eps=PreprocessConfig.EPS)
+    record_summary = build_record_summary(beat_features_all)
+    preprocess_summary = build_preprocess_summary(
+        beat_features_all=beat_features_all,
+        beat_features_valid=beat_features_valid,
+        feature_names=feature_names,
+        feature_groups=FEATURE_GROUPS,
+    )
 
     export_feature_outputs(
         preprocess_root=output_paths["preprocess_root"],
@@ -1136,6 +1383,15 @@ def main() -> None:
         record_summary=record_summary,
         feature_names=feature_names,
         learning_input_columns=learning_input_columns,
+        feature_groups=FEATURE_GROUPS,
+        preprocess_summary=preprocess_summary,
+    )
+
+    logger.info(
+        "전처리 완료: total_cycles=%s, valid_cycles=%s, feature_dim=%s",
+        len(beat_features_all),
+        len(beat_features_valid),
+        len(feature_names),
     )
 
 

@@ -1,5 +1,5 @@
 """
-Representation learning script fixed to the current unsupervised design.
+Representation learning script for the revised Heart-Sound-Unsupervised-Model pipeline.
 
 Expected input files:
 - outputs/{PREPROCESS_RUN_NAME}/preprocess/beat_features_valid.csv
@@ -10,7 +10,11 @@ Saved artifacts:
 - outputs/{RUN_NAME}/training/dae_best.pt
 - outputs/{RUN_NAME}/training/scaler.joblib
 - outputs/{RUN_NAME}/training/training_history.csv
-- outputs/{RUN_NAME}/training/latent_valid.csv
+- outputs/{RUN_NAME}/training/reconstruction_summary_by_split.csv
+- outputs/{RUN_NAME}/training/latent_train.csv
+- outputs/{RUN_NAME}/training/latent_val.csv
+- outputs/{RUN_NAME}/training/latent_test.csv
+- outputs/{RUN_NAME}/training/latent_all_valid.csv
 - outputs/{RUN_NAME}/training/split_info.json
 """
 
@@ -20,6 +24,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -30,14 +35,21 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
 class TrainingConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
 
     # 아래 2개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
     PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
     OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\training"
+
     RANDOM_SEED = 42
+    HIDDEN_DIMS = [256, 128, 64]
     LATENT_DIM = 12
+    DROPOUT = 0.10
     BATCH_SIZE = 256
     MAX_EPOCHS = 100
     EARLY_STOPPING_PATIENCE = 15
@@ -51,20 +63,29 @@ class TrainingConfig:
     BEAT_FEATURES_FILENAME = "beat_features_valid.csv"
     LEARNING_INPUT_COLUMNS_FILENAME = "learning_input_columns.json"
     FEATURE_NAMES_FILENAME = "feature_names.json"
+
     MODEL_FILENAME = "dae_best.pt"
     SCALER_FILENAME = "scaler.joblib"
     TRAINING_HISTORY_FILENAME = "training_history.csv"
-    LATENT_FILENAME = "latent_valid.csv"
+    RECONSTRUCTION_SUMMARY_FILENAME = "reconstruction_summary_by_split.csv"
+    LATENT_TRAIN_FILENAME = "latent_train.csv"
+    LATENT_VAL_FILENAME = "latent_val.csv"
+    LATENT_TEST_FILENAME = "latent_test.csv"
+    LATENT_ALL_VALID_FILENAME = "latent_all_valid.csv"
     SPLIT_INFO_FILENAME = "split_info.json"
-
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
 
 REQUIRED_METADATA_COLUMNS = [
     "record_id",
     "beat_index",
+    "valid_flag",
+]
+
+LATENT_METADATA_COLUMNS = [
+    "record_id",
+    "source_file",
+    "beat_index",
+    "cycle_index",
     "valid_flag",
 ]
 
@@ -79,27 +100,40 @@ class SplitData:
     test_records: list[str]
 
 
+# =================================================
+# 1. Model Definition
+# =================================================
+
+
 class DenoisingAutoencoder(nn.Module):
-    def __init__(self, input_dim: int, latent_dim: int) -> None:
+    def __init__(self, input_dim: int, hidden_dims: list[int], latent_dim: int, dropout: float) -> None:
         super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, latent_dim),
+        self.encoder = self._build_mlp(
+            dims=[input_dim, *hidden_dims, latent_dim],
+            dropout=dropout,
+            apply_dropout_on_last=False,
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, input_dim),
+        self.decoder = self._build_mlp(
+            dims=[latent_dim, *list(reversed(hidden_dims)), input_dim],
+            dropout=dropout,
+            apply_dropout_on_last=False,
         )
+
+    @staticmethod
+    def _build_mlp(dims: list[int], dropout: float, apply_dropout_on_last: bool) -> nn.Sequential:
+        layers: list[nn.Module] = []
+        for index in range(len(dims) - 1):
+            in_dim = dims[index]
+            out_dim = dims[index + 1]
+            is_last = index == len(dims) - 2
+            layers.append(nn.Linear(in_dim, out_dim))
+            if not is_last:
+                layers.append(nn.ReLU())
+                if dropout > 0.0:
+                    layers.append(nn.Dropout(dropout))
+            elif apply_dropout_on_last and dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+        return nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(x)
@@ -107,6 +141,11 @@ class DenoisingAutoencoder(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encoder(x)
+
+
+# =================================================
+# 2. Utility Helpers
+# =================================================
 
 
 def set_random_seed(seed: int) -> None:
@@ -131,6 +170,17 @@ def load_json_list(file_path: Path) -> list[str]:
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
         raise ValueError(f"Expected JSON string list: {file_path}")
     return values
+
+
+def _safe_split_ratio_sum(train_ratio: float, val_ratio: float, test_ratio: float) -> None:
+    total = float(train_ratio + val_ratio + test_ratio)
+    if not np.isclose(total, 1.0, atol=1e-6):
+        raise ValueError(f"Split ratios must sum to 1.0, got {total}")
+
+
+# =================================================
+# 3. Input Loading / Validation
+# =================================================
 
 
 def load_representation_inputs(input_root: Path) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -169,9 +219,6 @@ def validate_input_frame(
     if unknown_learning_columns:
         raise ValueError(f"Columns in learning_input_columns.json are absent from feature_names.json: {unknown_learning_columns}")
 
-    if feature_frame["valid_flag"].isnull().any():
-        raise ValueError("valid_flag contains null values")
-
     valid_flags = pd.to_numeric(feature_frame["valid_flag"], errors="raise").astype(np.int64)
     if np.any(valid_flags != 1):
         raise ValueError("beat_features_valid.csv must contain only valid beats with valid_flag = 1")
@@ -181,11 +228,21 @@ def validate_input_frame(
         failing = null_counts[null_counts > 0].to_dict()
         raise ValueError(f"Learning input columns contain null values: {failing}")
 
+    numeric_matrix = feature_frame.loc[:, learning_input_columns].to_numpy(dtype=np.float32)
+    if not np.isfinite(numeric_matrix).all():
+        raise ValueError("Learning input matrix contains non-finite values")
+
+
+# =================================================
+# 4. Split Helpers
+# =================================================
+
 
 def allocate_split_counts(num_records: int, train_ratio: float, val_ratio: float, test_ratio: float) -> dict[str, int]:
     if num_records < 3:
         raise ValueError("At least three distinct record_id values are required for train/validation/test split")
 
+    _safe_split_ratio_sum(train_ratio, val_ratio, test_ratio)
     ratios = {
         "train": train_ratio,
         "validation": val_ratio,
@@ -218,6 +275,7 @@ def allocate_split_counts(num_records: int, train_ratio: float, val_ratio: float
 
     if sum(counts.values()) != num_records:
         raise ValueError("Split count allocation failed")
+
     return counts
 
 
@@ -270,6 +328,11 @@ def dataframe_to_feature_matrix(frame: pd.DataFrame, feature_columns: list[str])
     return matrix
 
 
+# =================================================
+# 5. Training Helpers
+# =================================================
+
+
 def build_tensor_loader(matrix: np.ndarray, batch_size: int, shuffle: bool, seed: int) -> DataLoader:
     dataset = TensorDataset(torch.from_numpy(matrix))
     generator = torch.Generator()
@@ -290,32 +353,33 @@ def mask_tensor(inputs: torch.Tensor, mask_ratio: float) -> torch.Tensor:
     return torch.where(mask, torch.zeros_like(inputs), inputs)
 
 
-def evaluate_model(
+def evaluate_reconstruction_loss(
     model: DenoisingAutoencoder,
-    criterion: nn.Module,
-    clean_matrix: np.ndarray,
-    noisy_matrix: np.ndarray,
+    input_matrix: np.ndarray,
+    target_matrix: np.ndarray,
     batch_size: int,
     device: torch.device,
 ) -> float:
     model.eval()
-    dataset = TensorDataset(torch.from_numpy(noisy_matrix), torch.from_numpy(clean_matrix))
+    dataset = TensorDataset(torch.from_numpy(input_matrix), torch.from_numpy(target_matrix))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    criterion = nn.MSELoss()
 
     total_loss = 0.0
     total_count = 0
     with torch.no_grad():
-        for noisy_batch, clean_batch in loader:
-            noisy_batch = noisy_batch.to(device=device, dtype=torch.float32)
-            clean_batch = clean_batch.to(device=device, dtype=torch.float32)
-            outputs = model(noisy_batch)
-            loss = criterion(outputs, clean_batch)
-            batch_size_current = int(clean_batch.shape[0])
+        for input_batch, target_batch in loader:
+            input_batch = input_batch.to(device=device, dtype=torch.float32)
+            target_batch = target_batch.to(device=device, dtype=torch.float32)
+            outputs = model(input_batch)
+            loss = criterion(outputs, target_batch)
+            batch_size_current = int(target_batch.shape[0])
             total_loss += float(loss.item()) * batch_size_current
             total_count += batch_size_current
 
     if total_count == 0:
         raise ValueError("Evaluation loader is empty")
+
     return total_loss / float(total_count)
 
 
@@ -327,7 +391,12 @@ def train_denoising_autoencoder(
     config: TrainingConfig,
 ) -> tuple[DenoisingAutoencoder, pd.DataFrame, int]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DenoisingAutoencoder(input_dim=input_dim, latent_dim=config.LATENT_DIM).to(device)
+    model = DenoisingAutoencoder(
+        input_dim=input_dim,
+        hidden_dims=list(config.HIDDEN_DIMS),
+        latent_dim=config.LATENT_DIM,
+        dropout=config.DROPOUT,
+    ).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.LEARNING_RATE,
@@ -369,11 +438,10 @@ def train_denoising_autoencoder(
             train_count += batch_size_current
 
         train_loss = train_loss_sum / float(train_count)
-        val_loss = evaluate_model(
+        val_loss = evaluate_reconstruction_loss(
             model=model,
-            criterion=criterion,
-            clean_matrix=val_matrix,
-            noisy_matrix=val_noisy,
+            input_matrix=val_noisy,
+            target_matrix=val_matrix,
             batch_size=config.BATCH_SIZE,
             device=device,
         )
@@ -404,21 +472,27 @@ def train_denoising_autoencoder(
         raise RuntimeError("Best model checkpoint was not created")
 
     model.load_state_dict(best_state_dict)
-    checkpoint_path = training_root / config.MODEL_FILENAME
     torch.save(
         {
             "model_state_dict": best_state_dict,
             "input_dim": input_dim,
+            "hidden_dims": list(config.HIDDEN_DIMS),
             "latent_dim": config.LATENT_DIM,
+            "dropout": config.DROPOUT,
             "mask_ratio": config.MASK_RATIO,
             "random_seed": config.RANDOM_SEED,
         },
-        checkpoint_path,
+        training_root / config.MODEL_FILENAME,
     )
     logger.info("best epoch: %s", best_epoch)
 
     history_frame = pd.DataFrame(history_rows)
     return model, history_frame, best_epoch
+
+
+# =================================================
+# 6. Latent / Summary Export
+# =================================================
 
 
 def extract_latent_dataframe(
@@ -441,23 +515,80 @@ def extract_latent_dataframe(
     latent_matrix = np.vstack(latent_batches)
     latent_columns = [f"latent_{index:02d}" for index in range(latent_matrix.shape[1])]
 
-    latent_frame = feature_frame.loc[:, ["record_id", "beat_index"]].copy()
+    metadata_columns = [column for column in LATENT_METADATA_COLUMNS if column in feature_frame.columns]
+    latent_frame = feature_frame.loc[:, metadata_columns].copy()
     for column_index, column_name in enumerate(latent_columns):
         latent_frame[column_name] = latent_matrix[:, column_index]
     return latent_frame
 
 
-def save_split_info(split_data: SplitData, training_root: Path, random_seed: int) -> None:
+def build_reconstruction_summary(
+    model: DenoisingAutoencoder,
+    split_frames: dict[str, pd.DataFrame],
+    split_matrices: dict[str, np.ndarray],
+    batch_size: int,
+    mask_ratio: float,
+    random_seed: int,
+) -> pd.DataFrame:
+    device = next(model.parameters()).device
+    rows: list[dict[str, Any]] = []
+
+    for split_index, split_name in enumerate(["train", "val", "test", "all_valid"], start=1):
+        frame = split_frames[split_name]
+        matrix = split_matrices[split_name]
+        masked_matrix = mask_numpy_array(
+            matrix=matrix,
+            mask_ratio=mask_ratio,
+            seed=random_seed + split_index,
+        )
+        clean_loss = evaluate_reconstruction_loss(
+            model=model,
+            input_matrix=matrix,
+            target_matrix=matrix,
+            batch_size=batch_size,
+            device=device,
+        )
+        masked_loss = evaluate_reconstruction_loss(
+            model=model,
+            input_matrix=masked_matrix,
+            target_matrix=matrix,
+            batch_size=batch_size,
+            device=device,
+        )
+        rows.append(
+            {
+                "split": split_name,
+                "num_records": int(frame["record_id"].nunique()),
+                "num_beats": int(len(frame)),
+                "reconstruction_loss_clean": clean_loss,
+                "reconstruction_loss_masked": masked_loss,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def save_split_info(split_data: SplitData, training_root: Path, config: TrainingConfig, input_dim: int) -> None:
     split_info = {
         "train_records": split_data.train_records,
         "validation_records": split_data.val_records,
         "test_records": split_data.test_records,
-        "random_seed": random_seed,
+        "random_seed": config.RANDOM_SEED,
+        "input_dim": int(input_dim),
+        "hidden_dims": list(config.HIDDEN_DIMS),
+        "latent_dim": int(config.LATENT_DIM),
+        "dropout": float(config.DROPOUT),
+        "mask_ratio": float(config.MASK_RATIO),
     }
-    (training_root / TrainingConfig.SPLIT_INFO_FILENAME).write_text(
+    (training_root / config.SPLIT_INFO_FILENAME).write_text(
         json.dumps(split_info, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+
+
+# =================================================
+# 7. Main
+# =================================================
 
 
 def main() -> None:
@@ -503,20 +634,20 @@ def main() -> None:
     val_matrix = dataframe_to_feature_matrix(split_data.val_frame, learning_input_columns)
     test_matrix = dataframe_to_feature_matrix(split_data.test_frame, learning_input_columns)
     all_valid_matrix = dataframe_to_feature_matrix(feature_frame, learning_input_columns)
-    input_dim = train_matrix.shape[1]
+    input_dim = int(train_matrix.shape[1])
     logger.info("input dimension: %s", input_dim)
 
     scaler = RobustScaler()
     scaler.fit(train_matrix)
-    logger.info("scaler fit 완료")
+    joblib.dump(scaler, training_root / config.SCALER_FILENAME)
+    logger.info("train split 기준 scaler fit 완료")
 
     train_scaled = scaler.transform(train_matrix).astype(np.float32)
     val_scaled = scaler.transform(val_matrix).astype(np.float32)
     test_scaled = scaler.transform(test_matrix).astype(np.float32)
     all_valid_scaled = scaler.transform(all_valid_matrix).astype(np.float32)
-    joblib.dump(scaler, training_root / config.SCALER_FILENAME)
 
-    model, history_frame, _best_epoch = train_denoising_autoencoder(
+    model, history_frame, best_epoch = train_denoising_autoencoder(
         train_matrix=train_scaled,
         val_matrix=val_scaled,
         input_dim=input_dim,
@@ -525,29 +656,65 @@ def main() -> None:
     )
     history_frame.to_csv(training_root / config.TRAINING_HISTORY_FILENAME, index=False)
 
-    criterion = nn.MSELoss()
-    test_noisy = mask_numpy_array(test_scaled, mask_ratio=config.MASK_RATIO, seed=config.RANDOM_SEED)
-    test_loss = evaluate_model(
+    latent_train = extract_latent_dataframe(
         model=model,
-        criterion=criterion,
-        clean_matrix=test_scaled,
-        noisy_matrix=test_noisy,
+        feature_frame=split_data.train_frame,
+        scaled_matrix=train_scaled,
         batch_size=config.BATCH_SIZE,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     )
-    logger.info("test reconstruction loss=%.8f", test_loss)
-
-    latent_frame = extract_latent_dataframe(
+    latent_val = extract_latent_dataframe(
+        model=model,
+        feature_frame=split_data.val_frame,
+        scaled_matrix=val_scaled,
+        batch_size=config.BATCH_SIZE,
+    )
+    latent_test = extract_latent_dataframe(
+        model=model,
+        feature_frame=split_data.test_frame,
+        scaled_matrix=test_scaled,
+        batch_size=config.BATCH_SIZE,
+    )
+    latent_all_valid = extract_latent_dataframe(
         model=model,
         feature_frame=feature_frame,
         scaled_matrix=all_valid_scaled,
         batch_size=config.BATCH_SIZE,
     )
-    latent_path = training_root / config.LATENT_FILENAME
-    latent_frame.to_csv(latent_path, index=False)
 
-    save_split_info(split_data=split_data, training_root=training_root, random_seed=config.RANDOM_SEED)
-    logger.info("latent export 경로: %s", latent_path)
+    latent_train.to_csv(training_root / config.LATENT_TRAIN_FILENAME, index=False)
+    latent_val.to_csv(training_root / config.LATENT_VAL_FILENAME, index=False)
+    latent_test.to_csv(training_root / config.LATENT_TEST_FILENAME, index=False)
+    latent_all_valid.to_csv(training_root / config.LATENT_ALL_VALID_FILENAME, index=False)
+
+    reconstruction_summary = build_reconstruction_summary(
+        model=model,
+        split_frames={
+            "train": split_data.train_frame,
+            "val": split_data.val_frame,
+            "test": split_data.test_frame,
+            "all_valid": feature_frame,
+        },
+        split_matrices={
+            "train": train_scaled,
+            "val": val_scaled,
+            "test": test_scaled,
+            "all_valid": all_valid_scaled,
+        },
+        batch_size=config.BATCH_SIZE,
+        mask_ratio=config.MASK_RATIO,
+        random_seed=config.RANDOM_SEED,
+    )
+    reconstruction_summary.to_csv(training_root / config.RECONSTRUCTION_SUMMARY_FILENAME, index=False)
+
+    save_split_info(
+        split_data=split_data,
+        training_root=training_root,
+        config=config,
+        input_dim=input_dim,
+    )
+
+    logger.info("best epoch=%s", best_epoch)
+    logger.info("latent export 완료: %s", training_root)
 
 
 if __name__ == "__main__":
