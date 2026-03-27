@@ -1,5 +1,5 @@
 """
-Beat-level preprocessing script fixed to the current unsupervised design.
+Cycle-level preprocessing script aligned to the current HeartSound Tool parameter design.
 
 Expected input schema per tabular file (.xlsx or .csv):
 - Amplitude
@@ -25,16 +25,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-import matplotlib
 import numpy as np
 import pandas as pd
-from scipy.signal import hilbert
 
 from excel_export_utils import export_stage_workbook
-
-matplotlib.use("Agg")
 
 
 class PreprocessConfig:
@@ -47,12 +43,27 @@ class PreprocessConfig:
     FILE_GLOB = "*"
     SUPPORTED_INPUT_SUFFIXES = (".xlsx", ".csv")
     CSV_ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
-    SAMPLING_RATE = 4000
-    MIN_CYCLE_MS = 250.0
-    MAX_CYCLE_MS = 1500.0
-    ENVELOPE_SMOOTH_MS = 10.0
-    TEMPLATE_RESAMPLE_LENGTH = 128
+    SAMPLING_RATE = 4000.0
+    SAMPLE_MS = 1000.0 / SAMPLING_RATE
+    REGION_THRESHOLD = 15.0
+    DEFAULT_CYCLE_SPACING = 4000
+    MAX_REGION_WIDTH_RATIO = 0.45
     EPS = 1e-12
+
+    DIASTOLIC_WINDOW_MIN_DURATION_MS = 18.0
+    CANDIDATE_MIN_WINDOW_MULTIPLIER = 2
+    S3_WINDOW_CONFIG = {
+        "offset_start_ms": 120.0,
+        "offset_end_ms": 200.0,
+        "fallback_start_ratio": 0.18,
+        "fallback_end_ratio": 0.34,
+    }
+    S4_WINDOW_CONFIG = {
+        "offset_start_ms": 200.0,
+        "offset_end_ms": 80.0,
+        "fallback_start_ratio": 0.72,
+        "fallback_end_ratio": 0.88,
+    }
 
     EXPECTED_COLUMNS = [
         "Amplitude",
@@ -66,11 +77,6 @@ class PreprocessConfig:
     EXPORT_CSV = True
     EXPORT_FEATURE_NAMES_JSON = True
     SAVE_INVALID_ROWS = True
-    LEARNING_INPUT_EXCLUDE_COLUMNS = [
-        "time_s1_center_time_ms",
-        "time_s2_center_time_ms",
-    ]
-
     EXCEL_FILENAME = "preprocess_export.xlsx"
     EXCEL_FREEZE_PANES = "A2"
     EXCEL_HEADER_FILL = "1F4E78"
@@ -82,116 +88,110 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-TIME_FEATURE_COLUMNS = [
-    "time_s1_duration_ms",
-    "time_s2_duration_ms",
-    "time_s1_center_time_ms",
-    "time_s2_center_time_ms",
-    "time_s1_on_to_s2_on_ms",
-    "time_s1_off_to_s2_on_ms",
-    "time_s2_on_to_next_s1_on_ms",
-    "time_s2_off_to_next_s1_on_ms",
-    "time_cycle_length_ms",
-    "time_cycle_length_s2_anchor_ms",
-    "time_heart_rate_bpm",
-    "time_systolic_fraction",
-    "time_diastolic_fraction",
-    "time_s1_fraction",
-    "time_s2_fraction",
-    "time_s1_s2_duration_ratio",
-    "time_sys_dia_ratio",
-    "time_center_to_center_interval_ms",
+S1_PARAMETER_COLUMNS = [
+    "S1_Width_ms",
+    "S1_Peak_mV",
+    "S1_mean_mV",
+    "S1_RMS_mV",
+    "S1_Area_mVms",
+    "S1_Sumation",
 ]
 
-AMPLITUDE_FEATURE_COLUMNS = [
-    "amp_s1_peak_abs",
-    "amp_s2_peak_abs",
-    "amp_s1_ptp",
-    "amp_s2_ptp",
-    "amp_s1_mean_abs",
-    "amp_s2_mean_abs",
-    "amp_s1_rms",
-    "amp_s2_rms",
-    "amp_s1_area_abs",
-    "amp_s2_area_abs",
-    "amp_s1_energy",
-    "amp_s2_energy",
-    "amp_s1_log_energy",
-    "amp_s2_log_energy",
-    "amp_s1_energy_per_ms",
-    "amp_s2_energy_per_ms",
-    "amp_s1_s2_peak_ratio",
-    "amp_s1_s2_energy_ratio",
+S2_PARAMETER_COLUMNS = [
+    "S2_Width_ms",
+    "S2_Peak_mV",
+    "S2_mean_mV",
+    "S2_RMS_mV",
+    "S2_Area_mVms",
+    "S2_Sumation",
 ]
 
-SHAPE_FEATURE_COLUMNS = [
-    "shape_s1_attack_time_ms",
-    "shape_s2_attack_time_ms",
-    "shape_s1_decay_time_ms",
-    "shape_s2_decay_time_ms",
-    "shape_s1_attack_decay_ratio",
-    "shape_s2_attack_decay_ratio",
-    "shape_s1_max_rise_slope",
-    "shape_s2_max_rise_slope",
-    "shape_s1_max_fall_slope",
-    "shape_s2_max_fall_slope",
-    "shape_s1_temporal_centroid_ms",
-    "shape_s2_temporal_centroid_ms",
+SYSTOLE_PARAMETER_COLUMNS = [
+    "Systole_Duration_ms",
+    "Systole_Peak_mV",
+    "Systole_mean_mV",
 ]
 
-STATISTICS_FEATURE_COLUMNS = [
-    "stat_s1_skewness",
-    "stat_s2_skewness",
-    "stat_s1_kurtosis",
-    "stat_s2_kurtosis",
-    "stat_s1_zero_crossing_rate",
-    "stat_s2_zero_crossing_rate",
-    "stat_s1_abs_sum_first_diff",
-    "stat_s2_abs_sum_first_diff",
+DIASTOLE_PARAMETER_COLUMNS = [
+    "Diastole_Duration_ms",
+    "Diastole_Peak_mV",
+    "Diastole_mean_mV",
+    "Diastole_S3_Expected_Delta_mV",
+    "Diastole_NaN_Gap_Delta_mV",
+    "Diastole_S4_Expected_Delta_mV",
 ]
 
-STABILITY_FEATURE_COLUMNS = [
-    "stab_s1_template_corr",
-    "stab_s2_template_corr",
+RS_PEAK_PARAMETER_COLUMNS = [
+    "S1S_RS_Peak",
+    "S1E_RS_Peak",
+    "S2S_RS_Peak",
+    "S2E_RS_Peak",
+]
+
+RS_WIDTH_PARAMETER_COLUMNS = [
+    "S1S_RS_Width_ms",
+    "S1E_RS_Width_ms",
+    "S2S_RS_Width_ms",
+    "S2E_RS_Width_ms",
+]
+
+RS_SUMATION_PARAMETER_COLUMNS = [
+    "S1S_RS_Sumation",
+    "S1E_RS_Sumation",
+    "S2S_RS_Sumation",
+    "S2E_RS_Sumation",
+]
+
+HEART_RATE_COLUMNS = [
+    "HeartRate_bpm",
 ]
 
 ALL_FEATURE_COLUMNS = (
-    TIME_FEATURE_COLUMNS
-    + AMPLITUDE_FEATURE_COLUMNS
-    + SHAPE_FEATURE_COLUMNS
-    + STATISTICS_FEATURE_COLUMNS
-    + STABILITY_FEATURE_COLUMNS
+    S1_PARAMETER_COLUMNS
+    + S2_PARAMETER_COLUMNS
+    + SYSTOLE_PARAMETER_COLUMNS
+    + DIASTOLE_PARAMETER_COLUMNS
+    + RS_PEAK_PARAMETER_COLUMNS
+    + RS_WIDTH_PARAMETER_COLUMNS
+    + RS_SUMATION_PARAMETER_COLUMNS
+    + HEART_RATE_COLUMNS
 )
 
 SUMMARY_SOURCE_COLUMNS = [
-    "time_s1_duration_ms",
-    "time_s2_duration_ms",
-    "time_s1_off_to_s2_on_ms",
-    "time_s2_off_to_next_s1_on_ms",
-    "time_cycle_length_ms",
-    "time_heart_rate_bpm",
-    "time_sys_dia_ratio",
+    "S1_Width_ms",
+    "S2_Width_ms",
+    "Systole_Duration_ms",
+    "Diastole_Duration_ms",
+    "HeartRate_bpm",
+    "S1_Peak_mV",
+    "S2_Peak_mV",
 ]
 
 METADATA_COLUMNS = [
     "record_id",
     "source_file",
     "beat_index",
+    "cycle_index",
     "valid_flag",
     "invalid_reason",
+    "S1_start",
+    "S1_end",
+    "S2_start",
+    "S2_end",
+    "next_S1_start",
+    "next_S1_end",
     "s1_on",
     "s1_off",
     "s2_on",
     "s2_off",
     "s1_on_next",
-    "s2_on_next",
 ]
 
 EVENT_COLUMN_MAP = {
-    "s1_on": "S1-Start_RS_Score",
-    "s1_off": "S1-End_RS_Score",
-    "s2_on": "S2-Start_RS_Score",
-    "s2_off": "S2-End_RS_Score",
+    "S1_start": "S1-Start_RS_Score",
+    "S1_end": "S1-End_RS_Score",
+    "S2_start": "S2-Start_RS_Score",
+    "S2_end": "S2-End_RS_Score",
 }
 
 
@@ -256,624 +256,693 @@ def load_recording_table(file_path: Path, expected_columns: list[str]) -> pd.Dat
         dataframe[column] = pd.to_numeric(dataframe[column], errors="raise").astype(np.float32)
 
     if len(dataframe) < 2:
-        raise ValueError(f"Recording is too short to define beat boundaries: {file_path.name}")
+        raise ValueError(f"Recording is too short to define cycles: {file_path.name}")
 
     logger.info("파일 로드 완료: %s, num_rows=%s", file_path.name, len(dataframe))
     return dataframe
 
 
-def find_positive_runs(score_array: np.ndarray) -> list[tuple[int, int]]:
-    positive_rows = np.flatnonzero(score_array > 0)
-    if positive_rows.size == 0:
+def _extract_threshold_peaks(values: np.ndarray, threshold: float) -> list[tuple[int, float]]:
+    peaks: list[tuple[int, float]] = []
+    best_index: int | None = None
+    best_value: float | None = None
+
+    for index, raw_value in enumerate(values):
+        value = float(raw_value)
+        if not np.isfinite(value) or value < threshold:
+            if best_index is not None and best_value is not None:
+                peaks.append((best_index, best_value))
+            best_index = None
+            best_value = None
+            continue
+
+        if best_index is None or best_value is None or value > best_value:
+            best_index = index
+            best_value = value
+
+    if best_index is not None and best_value is not None:
+        peaks.append((best_index, best_value))
+
+    return peaks
+
+
+def _estimate_peak_spacing(peaks: list[tuple[int, float]]) -> int | None:
+    if len(peaks) < 2:
+        return None
+
+    spacings = sorted(
+        peaks[index][0] - peaks[index - 1][0]
+        for index in range(1, len(peaks))
+        if peaks[index][0] - peaks[index - 1][0] > 0
+    )
+    if not spacings:
+        return None
+
+    return int(spacings[len(spacings) // 2])
+
+
+def _build_region_overlays(label: str, start_values: np.ndarray, end_values: np.ndarray) -> list[dict[str, Any]]:
+    start_peaks = _extract_threshold_peaks(start_values, PreprocessConfig.REGION_THRESHOLD)
+    end_peaks = _extract_threshold_peaks(end_values, PreprocessConfig.REGION_THRESHOLD)
+    if not start_peaks or not end_peaks:
         return []
 
-    runs: list[tuple[int, int]] = []
-    run_start = int(positive_rows[0])
-    previous_row = int(positive_rows[0])
-    for row_index in positive_rows[1:]:
-        row_index = int(row_index)
-        if row_index == previous_row + 1:
-            previous_row = row_index
+    cycle_spacing = (
+        _estimate_peak_spacing(start_peaks)
+        or _estimate_peak_spacing(end_peaks)
+        or PreprocessConfig.DEFAULT_CYCLE_SPACING
+    )
+    max_region_width = max(1, int(cycle_spacing * PreprocessConfig.MAX_REGION_WIDTH_RATIO))
+
+    overlays: list[dict[str, Any]] = []
+    end_peak_index = 0
+
+    for index, start_peak in enumerate(start_peaks):
+        next_start_index = start_peaks[index + 1][0] if index + 1 < len(start_peaks) else None
+
+        while end_peak_index < len(end_peaks) and end_peaks[end_peak_index][0] <= start_peak[0]:
+            end_peak_index += 1
+
+        if end_peak_index >= len(end_peaks):
+            break
+
+        end_peak = end_peaks[end_peak_index]
+        if next_start_index is not None and end_peak[0] >= next_start_index:
             continue
-        runs.append((run_start, previous_row))
-        run_start = row_index
-        previous_row = row_index
-    runs.append((run_start, previous_row))
-    return runs
 
+        region_width = end_peak[0] - start_peak[0]
+        if region_width <= 0 or region_width > max_region_width:
+            continue
 
-def representative_peak_row(score_array: np.ndarray, start_row: int, end_row: int) -> int:
-    run_scores = score_array[start_row : end_row + 1]
-    max_score = np.max(run_scores)
-    plateau_rows = np.flatnonzero(run_scores == max_score)
-    plateau_center = int(plateau_rows[len(plateau_rows) // 2])
-    return start_row + plateau_center
-
-
-def extract_event_candidates(score_array: np.ndarray, event_name: str) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for run_start_row, run_end_row in find_positive_runs(score_array):
-        peak_row = representative_peak_row(score_array, run_start_row, run_end_row)
-        candidates.append(
+        overlays.append(
             {
-                "event_name": event_name,
-                "run_start_row": int(run_start_row),
-                "run_end_row": int(run_end_row),
-                "row_index": int(peak_row),
-                "sample_index": int(peak_row),
-                "peak_score": float(score_array[peak_row]),
+                "label": label,
+                "startPeak": start_peak,
+                "endPeak": end_peak,
+                "areaStart": start_peak[0],
+                "areaEnd": end_peak[0],
             }
         )
-    return candidates
+        end_peak_index += 1
+
+    return overlays
 
 
-def events_between(
-    events: list[dict[str, Any]],
-    left_sample: int,
-    right_sample: int,
-) -> list[dict[str, Any]]:
-    return [
-        event
-        for event in events
-        if left_sample < int(event["sample_index"]) < right_sample
-    ]
+def _get_region_score(overlay: dict[str, Any]) -> float:
+    start_peak = overlay.get("startPeak") or (0, 0.0)
+    end_peak = overlay.get("endPeak") or (0, 0.0)
+    return max(float(start_peak[1]), float(end_peak[1]))
 
 
-def choose_ordered_boundaries(
-    s1_on: dict[str, Any],
-    s1_on_next: dict[str, Any],
-    s1_off_candidates: list[dict[str, Any]],
-    s2_on_candidates: list[dict[str, Any]],
-    s2_off_candidates: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, str]:
-    cycle_start = int(s1_on["sample_index"])
-    cycle_end = int(s1_on_next["sample_index"])
+def _regions_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return int(left["areaStart"]) <= int(right["areaEnd"]) and int(right["areaStart"]) <= int(left["areaEnd"])
 
-    if len(s1_off_candidates) == 0:
-        return None, "missing_s1_off"
-    if len(s2_on_candidates) == 0:
-        return None, "missing_s2_on"
-    if len(s2_off_candidates) == 0:
-        return None, "missing_s2_off"
 
-    valid_combinations: list[tuple[tuple[float, float, float], dict[str, Any]]] = []
-    for s1_off in s1_off_candidates:
-        s1_off_sample = int(s1_off["sample_index"])
-        if not cycle_start < s1_off_sample < cycle_end:
+def _resolve_region_overlaps(
+    first_overlays: list[dict[str, Any]],
+    second_overlays: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ordered = sorted(
+        [*first_overlays, *second_overlays],
+        key=lambda overlay: (int(overlay["areaStart"]), -_get_region_score(overlay)),
+    )
+    resolved: list[dict[str, Any]] = []
+
+    for overlay in ordered:
+        previous = resolved[-1] if resolved else None
+        if previous is None or previous["label"] == overlay["label"] or not _regions_overlap(previous, overlay):
+            resolved.append(overlay)
             continue
-        for s2_on in s2_on_candidates:
-            s2_on_sample = int(s2_on["sample_index"])
-            if not s1_off_sample <= s2_on_sample < cycle_end:
-                continue
-            for s2_off in s2_off_candidates:
-                s2_off_sample = int(s2_off["sample_index"])
-                if not s2_on_sample < s2_off_sample < cycle_end:
-                    continue
 
-                total_peak_score = (
-                    float(s1_off["peak_score"])
-                    + float(s2_on["peak_score"])
-                    + float(s2_off["peak_score"])
-                )
-                total_span = (
-                    (int(s1_off["run_end_row"]) - int(s1_off["run_start_row"]))
-                    + (int(s2_on["run_end_row"]) - int(s2_on["run_start_row"]))
-                    + (int(s2_off["run_end_row"]) - int(s2_off["run_start_row"]))
-                )
-                sort_key = (total_peak_score, float(total_span), float(s2_off_sample))
-                valid_combinations.append(
-                    (
-                        sort_key,
-                        {
-                            "s1_on": s1_on,
-                            "s1_off": s1_off,
-                            "s2_on": s2_on,
-                            "s2_off": s2_off,
-                            "s1_on_next": s1_on_next,
-                        },
-                    )
-                )
+        if _get_region_score(overlay) > _get_region_score(previous):
+            resolved[-1] = overlay
 
-    if not valid_combinations:
-        return None, "invalid_boundary_order"
-
-    valid_combinations.sort(key=lambda item: item[0], reverse=True)
-    return valid_combinations[0][1], ""
+    resolved_first = [overlay for overlay in resolved if overlay["label"] == "S1"]
+    resolved_second = [overlay for overlay in resolved if overlay["label"] == "S2"]
+    return resolved_first, resolved_second
 
 
-def load_boundaries_from_recording(recording_table: pd.DataFrame) -> list[dict[str, Any]]:
-    event_candidates = {
-        event_name: extract_event_candidates(
-            recording_table[column_name].to_numpy(dtype=np.float32),
-            event_name=event_name,
-        )
-        for event_name, column_name in EVENT_COLUMN_MAP.items()
-    }
-
-    s1_on_events = event_candidates["s1_on"]
-    if len(s1_on_events) < 2:
-        raise ValueError("At least two S1 onset events are required to define beats.")
-
-    beats: list[dict[str, Any]] = []
-    for beat_index in range(len(s1_on_events) - 1):
-        s1_on = s1_on_events[beat_index]
-        s1_on_next = s1_on_events[beat_index + 1]
-        left_sample = int(s1_on["sample_index"])
-        right_sample = int(s1_on_next["sample_index"])
-
-        selected, invalid_reason = choose_ordered_boundaries(
-            s1_on=s1_on,
-            s1_on_next=s1_on_next,
-            s1_off_candidates=events_between(event_candidates["s1_off"], left_sample, right_sample),
-            s2_on_candidates=events_between(event_candidates["s2_on"], left_sample, right_sample),
-            s2_off_candidates=events_between(event_candidates["s2_off"], left_sample, right_sample),
-        )
-
-        beat_row: dict[str, Any] = {
-            "beat_index": int(beat_index),
-            "invalid_reason": invalid_reason,
-            "s1_on": int(s1_on["sample_index"]),
-            "s1_off": np.nan,
-            "s2_on": np.nan,
-            "s2_off": np.nan,
-            "s1_on_next": int(s1_on_next["sample_index"]),
-            "s2_on_next": np.nan,
-            "s1_on_row": int(s1_on["row_index"]),
-            "s1_off_row": np.nan,
-            "s2_on_row": np.nan,
-            "s2_off_row": np.nan,
-            "s1_on_next_row": int(s1_on_next["row_index"]),
-        }
-
-        if selected is not None:
-            beat_row.update(
-                {
-                    "s1_off": int(selected["s1_off"]["sample_index"]),
-                    "s2_on": int(selected["s2_on"]["sample_index"]),
-                    "s2_off": int(selected["s2_off"]["sample_index"]),
-                    "s1_off_row": int(selected["s1_off"]["row_index"]),
-                    "s2_on_row": int(selected["s2_on"]["row_index"]),
-                    "s2_off_row": int(selected["s2_off"]["row_index"]),
-                }
-            )
-        beats.append(beat_row)
-
-    for beat_index in range(len(beats) - 1):
-        next_s2_on = beats[beat_index + 1]["s2_on"]
-        if pd.notna(next_s2_on):
-            beats[beat_index]["s2_on_next"] = int(next_s2_on)
-
-    return beats
-
-
-def samples_to_ms(num_samples: float, fs: int) -> float:
-    return float(1000.0 * float(num_samples) / float(fs))
-
-
-def safe_nan_ratio(numerator: float, denominator: float) -> float:
-    numerator = float(numerator)
-    denominator = float(denominator)
-    if denominator <= 0:
-        return float(np.nan)
-    return float(numerator / denominator)
-
-
-def safe_eps_ratio(numerator: float, denominator: float, eps: float) -> float:
-    numerator = float(numerator)
-    denominator = float(denominator)
-    if np.isnan(numerator) or np.isnan(denominator):
-        return float(np.nan)
-    return float(numerator / (denominator + eps))
-
-
-def nan_feature_map() -> dict[str, float]:
+def _nan_feature_map() -> dict[str, float]:
     return {column: float(np.nan) for column in ALL_FEATURE_COLUMNS}
 
 
-def validate_beat_boundaries(
-    beat: dict[str, Any],
-    signal_length: int,
-    fs: int,
-    min_cycle_ms: float,
-    max_cycle_ms: float,
-) -> tuple[bool, str]:
-    required_columns = ["s1_on", "s1_off", "s2_on", "s2_off", "s1_on_next"]
-    if any(pd.isna(beat[column]) for column in required_columns):
-        return False, beat["invalid_reason"] or "missing_boundary"
+def _nan_row(columns: list[str]) -> dict[str, float]:
+    return {column: float(np.nan) for column in columns}
 
-    s1_on = int(beat["s1_on"])
-    s1_off = int(beat["s1_off"])
-    s2_on = int(beat["s2_on"])
-    s2_off = int(beat["s2_off"])
-    s1_on_next = int(beat["s1_on_next"])
 
-    if not (0 <= s1_on < s1_off <= s2_on < s2_off < s1_on_next <= signal_length):
-        return False, "invalid_boundary_order"
+def _is_valid_cycle_order(
+    s1_start: int | float | None,
+    s1_end: int | float | None,
+    s2_start: int | float | None,
+    s2_end: int | float | None,
+    next_s1_start: int | float | None,
+) -> bool:
+    try:
+        values = [s1_start, s1_end, s2_start, s2_end, next_s1_start]
+        if any(value is None or not np.isfinite(float(value)) for value in values):
+            return False
+        safe_s1_start = int(float(s1_start))
+        safe_s1_end = int(float(s1_end))
+        safe_s2_start = int(float(s2_start))
+        safe_s2_end = int(float(s2_end))
+        safe_next_s1_start = int(float(next_s1_start))
+    except Exception:
+        return False
 
-    cycle_length_ms = samples_to_ms(s1_on_next - s1_on, fs)
-    if cycle_length_ms <= 0:
-        return False, "non_positive_cycle_length"
-    if cycle_length_ms < min_cycle_ms or cycle_length_ms > max_cycle_ms:
-        return False, "cycle_length_out_of_range"
+    return safe_s1_start < safe_s1_end < safe_s2_start < safe_s2_end < safe_next_s1_start
+
+
+def _validate_cycle_boundaries(cycle_row: dict[str, Any], signal_length: int) -> tuple[bool, str]:
+    required_columns = ["S1_start", "S1_end", "S2_start", "S2_end", "next_S1_start"]
+    if any(pd.isna(cycle_row[column]) for column in required_columns):
+        return False, "missing_boundary"
+
+    if not _is_valid_cycle_order(
+        cycle_row["S1_start"],
+        cycle_row["S1_end"],
+        cycle_row["S2_start"],
+        cycle_row["S2_end"],
+        cycle_row["next_S1_start"],
+    ):
+        return False, "invalid_cycle_order"
+
+    s1_start = int(cycle_row["S1_start"])
+    s1_end = int(cycle_row["S1_end"])
+    s2_start = int(cycle_row["S2_start"])
+    s2_end = int(cycle_row["S2_end"])
+    next_s1_start = int(cycle_row["next_S1_start"])
+    if not (0 <= s1_start < s1_end < s2_start < s2_end < next_s1_start <= signal_length):
+        return False, "out_of_bounds"
 
     return True, ""
 
 
-def compute_smoothed_envelope(x: np.ndarray, fs: int, smooth_ms: float) -> np.ndarray:
-    envelope_raw = np.abs(hilbert(x))
-    window_size = max(3, int(round((smooth_ms / 1000.0) * fs)))
-    kernel = np.ones(window_size, dtype=np.float32) / float(window_size)
-    return np.convolve(envelope_raw.astype(np.float32), kernel, mode="same").astype(np.float32)
+def _build_cycles_from_recording(recording_table: pd.DataFrame) -> list[dict[str, Any]]:
+    s1_start_values = recording_table[EVENT_COLUMN_MAP["S1_start"]].to_numpy(dtype=np.float32)
+    s1_end_values = recording_table[EVENT_COLUMN_MAP["S1_end"]].to_numpy(dtype=np.float32)
+    s2_start_values = recording_table[EVENT_COLUMN_MAP["S2_start"]].to_numpy(dtype=np.float32)
+    s2_end_values = recording_table[EVENT_COLUMN_MAP["S2_end"]].to_numpy(dtype=np.float32)
 
+    s1_overlays = _build_region_overlays("S1", s1_start_values, s1_end_values)
+    s2_overlays = _build_region_overlays("S2", s2_start_values, s2_end_values)
+    resolved_s1, _ = _resolve_region_overlaps(s1_overlays, [])
+    _, resolved_s2 = _resolve_region_overlaps([], s2_overlays)
+    sorted_s1 = sorted(resolved_s1, key=lambda overlay: int(overlay["areaStart"]))
+    sorted_s2 = sorted(resolved_s2, key=lambda overlay: int(overlay["areaStart"]))
 
-def segment_from_rows(signal: np.ndarray, row_start: int, row_end: int) -> np.ndarray:
-    if row_start < 0 or row_end > len(signal) or row_start >= row_end:
-        return np.empty(0, dtype=np.float32)
-    return signal[row_start:row_end].astype(np.float32, copy=False)
+    if not sorted_s1:
+        raise ValueError("No valid S1 overlays were detected from RS score channels.")
 
+    rows: list[dict[str, Any]] = []
+    s2_index = 0
+    for cycle_index, s1_overlay in enumerate(sorted_s1, start=1):
+        s1_start = int(s1_overlay["areaStart"])
+        s1_end = int(s1_overlay["areaEnd"])
+        next_s1_overlay = sorted_s1[cycle_index] if cycle_index < len(sorted_s1) else None
+        next_s1_start = int(next_s1_overlay["areaStart"]) if next_s1_overlay is not None else np.nan
+        next_s1_end = int(next_s1_overlay["areaEnd"]) if next_s1_overlay is not None else np.nan
 
-def zscore_normalize(values: np.ndarray, eps: float) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    if values.size == 0:
-        return values.copy()
-    mean_value = float(np.mean(values))
-    std_value = float(np.std(values))
-    if std_value <= eps:
-        return np.zeros_like(values, dtype=np.float32)
-    return ((values - mean_value) / std_value).astype(np.float32)
+        while s2_index < len(sorted_s2) and int(sorted_s2[s2_index]["areaEnd"]) <= s1_start:
+            s2_index += 1
 
+        matched_s2: dict[str, Any] | None = None
+        probe_index = s2_index
+        while probe_index < len(sorted_s2):
+            candidate = sorted_s2[probe_index]
+            candidate_start = int(candidate["areaStart"])
+            candidate_end = int(candidate["areaEnd"])
+            if candidate_end <= s1_start:
+                probe_index += 1
+                continue
+            if np.isfinite(next_s1_start) and candidate_start >= int(next_s1_start):
+                break
+            if s1_start < s1_end < candidate_start < candidate_end and (
+                not np.isfinite(next_s1_start) or candidate_end < int(next_s1_start)
+            ):
+                matched_s2 = candidate
+                s2_index = probe_index + 1
+                break
+            probe_index += 1
 
-def resample_linear(values: np.ndarray, target_length: int) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    if values.size == 0:
-        return np.full(target_length, np.nan, dtype=np.float32)
-    if values.size == 1:
-        return np.full(target_length, float(values[0]), dtype=np.float32)
+        s2_start = int(matched_s2["areaStart"]) if matched_s2 is not None else np.nan
+        s2_end = int(matched_s2["areaEnd"]) if matched_s2 is not None else np.nan
 
-    source_x = np.linspace(0.0, 1.0, num=values.size, dtype=np.float32)
-    target_x = np.linspace(0.0, 1.0, num=target_length, dtype=np.float32)
-    return np.interp(target_x, source_x, values).astype(np.float32)
-
-
-def compute_time_features(beat: dict[str, Any], fs: int) -> dict[str, float]:
-    s1_on = int(beat["s1_on"])
-    s1_off = int(beat["s1_off"])
-    s2_on = int(beat["s2_on"])
-    s2_off = int(beat["s2_off"])
-    s1_on_next = int(beat["s1_on_next"])
-    cycle_length_samples = s1_on_next - s1_on
-    cycle_length_ms = samples_to_ms(cycle_length_samples, fs)
-
-    s1_center = 0.5 * (s1_on + s1_off)
-    s2_center = 0.5 * (s2_on + s2_off)
-
-    s2_on_next = float(beat["s2_on_next"]) if pd.notna(beat["s2_on_next"]) else float(np.nan)
-    if np.isnan(s2_on_next):
-        cycle_length_s2_anchor_ms = float(np.nan)
-    else:
-        cycle_length_s2_anchor_ms = samples_to_ms(s2_on_next - s2_on, fs)
-
-    return {
-        "time_s1_duration_ms": samples_to_ms(s1_off - s1_on, fs),
-        "time_s2_duration_ms": samples_to_ms(s2_off - s2_on, fs),
-        "time_s1_center_time_ms": samples_to_ms(s1_center, fs),
-        "time_s2_center_time_ms": samples_to_ms(s2_center, fs),
-        "time_s1_on_to_s2_on_ms": samples_to_ms(s2_on - s1_on, fs),
-        "time_s1_off_to_s2_on_ms": samples_to_ms(s2_on - s1_off, fs),
-        "time_s2_on_to_next_s1_on_ms": samples_to_ms(s1_on_next - s2_on, fs),
-        "time_s2_off_to_next_s1_on_ms": samples_to_ms(s1_on_next - s2_off, fs),
-        "time_cycle_length_ms": cycle_length_ms,
-        "time_cycle_length_s2_anchor_ms": cycle_length_s2_anchor_ms,
-        "time_heart_rate_bpm": float(60000.0 / cycle_length_ms) if cycle_length_ms > 0 else float(np.nan),
-        "time_systolic_fraction": safe_nan_ratio(s2_on - s1_on, cycle_length_samples),
-        "time_diastolic_fraction": safe_nan_ratio(s1_on_next - s2_on, cycle_length_samples),
-        "time_s1_fraction": safe_nan_ratio(s1_off - s1_on, cycle_length_samples),
-        "time_s2_fraction": safe_nan_ratio(s2_off - s2_on, cycle_length_samples),
-        "time_s1_s2_duration_ratio": safe_nan_ratio(s1_off - s1_on, s2_off - s2_on),
-        "time_sys_dia_ratio": safe_nan_ratio(s2_on - s1_on, s1_on_next - s2_on),
-        "time_center_to_center_interval_ms": samples_to_ms(s2_center - s1_center, fs),
-    }
-
-
-def compute_segment_amplitude_features(
-    segment: np.ndarray,
-    duration_ms: float,
-    prefix: str,
-    eps: float,
-) -> dict[str, float]:
-    if segment.size == 0:
-        return {
-            f"amp_{prefix}_peak_abs": float(np.nan),
-            f"amp_{prefix}_ptp": float(np.nan),
-            f"amp_{prefix}_mean_abs": float(np.nan),
-            f"amp_{prefix}_rms": float(np.nan),
-            f"amp_{prefix}_area_abs": float(np.nan),
-            f"amp_{prefix}_energy": float(np.nan),
-            f"amp_{prefix}_log_energy": float(np.nan),
-            f"amp_{prefix}_energy_per_ms": float(np.nan),
-        }
-
-    energy = float(np.sum(np.square(segment)))
-    return {
-        f"amp_{prefix}_peak_abs": float(np.max(np.abs(segment))),
-        f"amp_{prefix}_ptp": float(np.ptp(segment)),
-        f"amp_{prefix}_mean_abs": float(np.mean(np.abs(segment))),
-        f"amp_{prefix}_rms": float(np.sqrt(np.mean(np.square(segment)))),
-        f"amp_{prefix}_area_abs": float(np.sum(np.abs(segment))),
-        f"amp_{prefix}_energy": energy,
-        f"amp_{prefix}_log_energy": float(np.log(energy + eps)),
-        f"amp_{prefix}_energy_per_ms": float(energy / (duration_ms + eps)),
-    }
-
-
-def compute_amplitude_energy_features(
-    x: np.ndarray,
-    envelope: np.ndarray,
-    beat: dict[str, Any],
-    fs: int,
-    eps: float,
-) -> dict[str, float]:
-    del envelope
-    s1 = segment_from_rows(x, int(beat["s1_on_row"]), int(beat["s1_off_row"]))
-    s2 = segment_from_rows(x, int(beat["s2_on_row"]), int(beat["s2_off_row"]))
-
-    s1_duration_ms = samples_to_ms(int(beat["s1_off"]) - int(beat["s1_on"]), fs)
-    s2_duration_ms = samples_to_ms(int(beat["s2_off"]) - int(beat["s2_on"]), fs)
-
-    features = {}
-    features.update(compute_segment_amplitude_features(s1, s1_duration_ms, "s1", eps))
-    features.update(compute_segment_amplitude_features(s2, s2_duration_ms, "s2", eps))
-    features["amp_s1_s2_peak_ratio"] = safe_eps_ratio(
-        features["amp_s1_peak_abs"],
-        features["amp_s2_peak_abs"],
-        eps,
-    )
-    features["amp_s1_s2_energy_ratio"] = safe_eps_ratio(
-        features["amp_s1_energy"],
-        features["amp_s2_energy"],
-        eps,
-    )
-    return features
-
-
-def compute_segment_shape_features(
-    env_segment: np.ndarray,
-    prefix: str,
-    fs: int,
-    eps: float,
-) -> dict[str, float]:
-    if env_segment.size == 0:
-        return {
-            f"shape_{prefix}_attack_time_ms": float(np.nan),
-            f"shape_{prefix}_decay_time_ms": float(np.nan),
-            f"shape_{prefix}_attack_decay_ratio": float(np.nan),
-            f"shape_{prefix}_max_rise_slope": float(np.nan),
-            f"shape_{prefix}_max_fall_slope": float(np.nan),
-            f"shape_{prefix}_temporal_centroid_ms": float(np.nan),
-        }
-
-    peak_idx_rel = int(np.argmax(env_segment))
-    attack_time_ms = samples_to_ms(peak_idx_rel, fs)
-    decay_time_ms = samples_to_ms(len(env_segment) - peak_idx_rel, fs)
-
-    if len(env_segment) < 2:
-        max_rise_slope = float(np.nan)
-        max_fall_slope = float(np.nan)
-    else:
-        env_diff = np.diff(env_segment)
-        max_rise_slope = float(np.max(env_diff) * fs)
-        max_fall_slope = float(np.min(env_diff) * fs)
-
-    t_rel = np.arange(len(env_segment), dtype=np.float32) / float(fs)
-    temporal_centroid_ms = float(
-        1000.0 * np.sum(t_rel * env_segment) / (float(np.sum(env_segment)) + eps)
-    )
-
-    return {
-        f"shape_{prefix}_attack_time_ms": attack_time_ms,
-        f"shape_{prefix}_decay_time_ms": decay_time_ms,
-        f"shape_{prefix}_attack_decay_ratio": safe_eps_ratio(attack_time_ms, decay_time_ms, eps),
-        f"shape_{prefix}_max_rise_slope": max_rise_slope,
-        f"shape_{prefix}_max_fall_slope": max_fall_slope,
-        f"shape_{prefix}_temporal_centroid_ms": temporal_centroid_ms,
-    }
-
-
-def compute_shape_features(
-    envelope: np.ndarray,
-    beat: dict[str, Any],
-    fs: int,
-    eps: float,
-) -> dict[str, float]:
-    env_s1 = segment_from_rows(envelope, int(beat["s1_on_row"]), int(beat["s1_off_row"]))
-    env_s2 = segment_from_rows(envelope, int(beat["s2_on_row"]), int(beat["s2_off_row"]))
-
-    features = {}
-    features.update(compute_segment_shape_features(env_s1, "s1", fs, eps))
-    features.update(compute_segment_shape_features(env_s2, "s2", fs, eps))
-    return features
-
-
-def compute_segment_statistics_features(segment: np.ndarray, prefix: str, eps: float) -> dict[str, float]:
-    if segment.size == 0:
-        return {
-            f"stat_{prefix}_skewness": float(np.nan),
-            f"stat_{prefix}_kurtosis": float(np.nan),
-            f"stat_{prefix}_zero_crossing_rate": float(np.nan),
-            f"stat_{prefix}_abs_sum_first_diff": float(np.nan),
-        }
-
-    mean_value = float(np.mean(segment))
-    std_value = float(np.std(segment))
-    normalized = (segment - mean_value) / (std_value + eps)
-    skewness = float(np.mean(np.power(normalized, 3)))
-    kurtosis = float(np.mean(np.power(normalized, 4)))
-
-    if len(segment) < 2:
-        zcr = float(np.nan)
-        abs_sum_first_diff = float(np.nan)
-    else:
-        sign_changes = np.count_nonzero(segment[:-1] * segment[1:] < 0)
-        zcr = float(sign_changes / (len(segment) - 1))
-        abs_sum_first_diff = float(np.sum(np.abs(np.diff(segment))))
-
-    return {
-        f"stat_{prefix}_skewness": skewness,
-        f"stat_{prefix}_kurtosis": kurtosis,
-        f"stat_{prefix}_zero_crossing_rate": zcr,
-        f"stat_{prefix}_abs_sum_first_diff": abs_sum_first_diff,
-    }
-
-
-def compute_statistics_complexity_features(
-    x: np.ndarray,
-    beat: dict[str, Any],
-    eps: float,
-) -> dict[str, float]:
-    s1 = segment_from_rows(x, int(beat["s1_on_row"]), int(beat["s1_off_row"]))
-    s2 = segment_from_rows(x, int(beat["s2_on_row"]), int(beat["s2_off_row"]))
-
-    features = {}
-    features.update(compute_segment_statistics_features(s1, "s1", eps))
-    features.update(compute_segment_statistics_features(s2, "s2", eps))
-    return features
-
-
-def build_template(
-    segments: list[np.ndarray],
-    target_length: int,
-    eps: float,
-) -> np.ndarray:
-    if not segments:
-        return np.full(target_length, np.nan, dtype=np.float32)
-
-    normalized_rows: list[np.ndarray] = []
-    for segment in segments:
-        resampled = resample_linear(segment, target_length)
-        normalized_rows.append(zscore_normalize(resampled, eps))
-    stacked = np.stack(normalized_rows).astype(np.float32)
-    return np.median(stacked, axis=0).astype(np.float32)
-
-
-def build_record_templates(
-    x: np.ndarray,
-    beat_rows: list[dict[str, Any]],
-    template_resample_length: int,
-    eps: float,
-) -> dict[str, np.ndarray]:
-    s1_segments: list[np.ndarray] = []
-    s2_segments: list[np.ndarray] = []
-    for beat in beat_rows:
-        if int(beat["valid_flag"]) != 1:
-            continue
-        s1 = segment_from_rows(x, int(beat["s1_on_row"]), int(beat["s1_off_row"]))
-        s2 = segment_from_rows(x, int(beat["s2_on_row"]), int(beat["s2_off_row"]))
-        if s1.size > 0:
-            s1_segments.append(s1)
-        if s2.size > 0:
-            s2_segments.append(s2)
-
-    return {
-        "s1": build_template(s1_segments, template_resample_length, eps),
-        "s2": build_template(s2_segments, template_resample_length, eps),
-    }
-
-
-def pearson_corr(left: np.ndarray, right: np.ndarray, eps: float) -> float:
-    if left.size == 0 or right.size == 0:
-        return float(np.nan)
-    if np.isnan(left).any() or np.isnan(right).any():
-        return float(np.nan)
-
-    left_std = float(np.std(left))
-    right_std = float(np.std(right))
-    if left_std <= eps or right_std <= eps:
-        return float(np.nan)
-
-    left_centered = left - float(np.mean(left))
-    right_centered = right - float(np.mean(right))
-    return float(np.mean(left_centered * right_centered) / (left_std * right_std))
-
-
-def compute_stability_features(
-    x: np.ndarray,
-    beat: dict[str, Any],
-    templates: dict[str, np.ndarray],
-    template_resample_length: int,
-    eps: float,
-) -> dict[str, float]:
-    features: dict[str, float] = {}
-    for prefix, row_start_key, row_end_key in [
-        ("s1", "s1_on_row", "s1_off_row"),
-        ("s2", "s2_on_row", "s2_off_row"),
-    ]:
-        segment = segment_from_rows(x, int(beat[row_start_key]), int(beat[row_end_key]))
-        if segment.size == 0:
-            features[f"stab_{prefix}_template_corr"] = float(np.nan)
-            continue
-        normalized_segment = zscore_normalize(
-            resample_linear(segment, template_resample_length),
-            eps,
+        rows.append(
+            {
+                "cycle_index": cycle_index,
+                "beat_index": cycle_index - 1,
+                "S1_start": s1_start,
+                "S1_end": s1_end,
+                "S2_start": s2_start,
+                "S2_end": s2_end,
+                "next_S1_start": next_s1_start,
+                "next_S1_end": next_s1_end,
+                "s1_on": s1_start,
+                "s1_off": s1_end,
+                "s2_on": s2_start,
+                "s2_off": s2_end,
+                "s1_on_next": next_s1_start,
+            }
         )
-        template = templates[prefix]
-        features[f"stab_{prefix}_template_corr"] = pearson_corr(
-            normalized_segment,
-            template,
-            eps,
-        )
-    return features
+
+    return rows
 
 
-def build_feature_row(
+def _compute_sound_parameter_row(
+    amplitude: np.ndarray,
+    start_index: int,
+    end_index: int,
+    *,
+    width_key: str,
+    peak_key: str,
+    mean_key: str,
+    rms_key: str,
+    area_key: str,
+    sumation_key: str,
+    nan_factory: Callable[[], dict[str, float]],
+) -> dict[str, float]:
+    safe_start = max(0, int(start_index))
+    safe_end = min(len(amplitude), int(end_index))
+    if safe_start >= safe_end or amplitude.size == 0:
+        return nan_factory()
+
+    segment = amplitude[safe_start:safe_end].astype(float, copy=False)
+    if segment.size == 0:
+        return nan_factory()
+
+    absolute_segment = np.abs(segment)
+    total_absolute = float(np.sum(absolute_segment))
+    peak_value = float(np.max(absolute_segment))
+    sumation_value = float(peak_value / total_absolute) if total_absolute > 0.0 else float(np.nan)
+
+    return {
+        width_key: float((safe_end - safe_start) * PreprocessConfig.SAMPLE_MS),
+        peak_key: peak_value,
+        mean_key: float(np.mean(absolute_segment)),
+        rms_key: float(np.sqrt(np.mean(segment ** 2))),
+        area_key: float(np.sum(absolute_segment) * PreprocessConfig.SAMPLE_MS),
+        sumation_key: sumation_value,
+    }
+
+
+def _compute_s1_parameter_row(amplitude: np.ndarray, start_index: int, end_index: int) -> dict[str, float]:
+    return _compute_sound_parameter_row(
+        amplitude,
+        start_index,
+        end_index,
+        width_key="S1_Width_ms",
+        peak_key="S1_Peak_mV",
+        mean_key="S1_mean_mV",
+        rms_key="S1_RMS_mV",
+        area_key="S1_Area_mVms",
+        sumation_key="S1_Sumation",
+        nan_factory=lambda: _nan_row(S1_PARAMETER_COLUMNS),
+    )
+
+
+def _compute_s2_parameter_row(amplitude: np.ndarray, start_index: int, end_index: int) -> dict[str, float]:
+    return _compute_sound_parameter_row(
+        amplitude,
+        start_index,
+        end_index,
+        width_key="S2_Width_ms",
+        peak_key="S2_Peak_mV",
+        mean_key="S2_mean_mV",
+        rms_key="S2_RMS_mV",
+        area_key="S2_Area_mVms",
+        sumation_key="S2_Sumation",
+        nan_factory=lambda: _nan_row(S2_PARAMETER_COLUMNS),
+    )
+
+
+def _compute_gap_parameter_row(
+    amplitude: np.ndarray,
+    *,
+    start_index: int,
+    end_index: int,
+    duration_key: str,
+    peak_key: str,
+    mean_key: str,
+    nan_factory: Callable[[], dict[str, float]],
+) -> dict[str, float]:
+    safe_start = max(0, int(start_index))
+    safe_end = min(len(amplitude), int(end_index))
+    if amplitude.size == 0 or safe_start >= safe_end:
+        return nan_factory()
+
+    segment = amplitude[safe_start:safe_end].astype(float, copy=False)
+    if segment.size == 0:
+        return nan_factory()
+
+    absolute_segment = np.abs(segment)
+    return {
+        duration_key: float((safe_end - safe_start) * PreprocessConfig.SAMPLE_MS),
+        peak_key: float(np.max(absolute_segment)),
+        mean_key: float(np.mean(absolute_segment)),
+    }
+
+
+def _compute_systole_parameter_row(
+    amplitude: np.ndarray,
+    s1_end_index: int,
+    s2_start_index: int,
+) -> dict[str, float]:
+    return _compute_gap_parameter_row(
+        amplitude,
+        start_index=s1_end_index,
+        end_index=s2_start_index,
+        duration_key="Systole_Duration_ms",
+        peak_key="Systole_Peak_mV",
+        mean_key="Systole_mean_mV",
+        nan_factory=lambda: _nan_row(SYSTOLE_PARAMETER_COLUMNS),
+    )
+
+
+def _ms_to_sample_count(duration_ms: float) -> int:
+    return max(1, int(round(duration_ms / PreprocessConfig.SAMPLE_MS)))
+
+
+def _resolve_diastolic_expected_window(
+    window_kind: str,
+    diastole_start: int,
+    diastole_end: int,
+    current_s2_end: int,
+    next_s1_start: int,
+) -> tuple[int, int] | None:
+    if diastole_end <= diastole_start:
+        return None
+
+    diastolic_length = diastole_end - diastole_start
+    minimum_window_length = _ms_to_sample_count(
+        PreprocessConfig.DIASTOLIC_WINDOW_MIN_DURATION_MS * PreprocessConfig.CANDIDATE_MIN_WINDOW_MULTIPLIER
+    )
+    config = PreprocessConfig.S3_WINDOW_CONFIG if window_kind == "S3" else PreprocessConfig.S4_WINDOW_CONFIG
+
+    if window_kind == "S3":
+        default_start = current_s2_end + _ms_to_sample_count(float(config["offset_start_ms"]))
+        default_end = current_s2_end + _ms_to_sample_count(float(config["offset_end_ms"]))
+    else:
+        default_start = next_s1_start - _ms_to_sample_count(float(config["offset_start_ms"]))
+        default_end = next_s1_start - _ms_to_sample_count(float(config["offset_end_ms"]))
+
+    clipped_default_start = max(diastole_start, min(default_start, diastole_end))
+    clipped_default_end = max(clipped_default_start, min(default_end, diastole_end))
+    if clipped_default_end - clipped_default_start >= minimum_window_length:
+        return clipped_default_start, clipped_default_end
+
+    fallback_start = diastole_start + int(diastolic_length * float(config["fallback_start_ratio"]))
+    fallback_end = diastole_start + int(diastolic_length * float(config["fallback_end_ratio"]))
+    clipped_fallback_start = max(diastole_start, min(fallback_start, diastole_end))
+    clipped_fallback_end = max(clipped_fallback_start, min(fallback_end, diastole_end))
+    if clipped_fallback_end - clipped_fallback_start < minimum_window_length:
+        return None
+
+    return clipped_fallback_start, clipped_fallback_end
+
+
+def _compute_segment_delta_value(amplitude: np.ndarray, start_index: int, end_index: int) -> float:
+    safe_start = max(0, int(start_index))
+    safe_end = min(len(amplitude), int(end_index))
+    if amplitude.size == 0 or safe_end - safe_start < 2:
+        return float(np.nan)
+
+    segment = np.nan_to_num(amplitude[safe_start:safe_end].astype(float, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    if segment.size < 2:
+        return float(np.nan)
+
+    return float(np.mean(np.abs(np.diff(segment))))
+
+
+def _compute_diastolic_expected_delta_row(
+    amplitude: np.ndarray,
+    s2_end_index: int,
+    next_s1_start_index: int,
+) -> dict[str, float]:
+    diastole_start = int(s2_end_index) + 1
+    diastole_end = int(next_s1_start_index) - 1
+    if diastole_end <= diastole_start:
+        return {
+            "Diastole_S3_Expected_Delta_mV": float(np.nan),
+            "Diastole_NaN_Gap_Delta_mV": float(np.nan),
+            "Diastole_S4_Expected_Delta_mV": float(np.nan),
+        }
+
+    s3_window = _resolve_diastolic_expected_window(
+        "S3",
+        diastole_start,
+        diastole_end,
+        int(s2_end_index),
+        int(next_s1_start_index),
+    )
+    s4_window = _resolve_diastolic_expected_window(
+        "S4",
+        diastole_start,
+        diastole_end,
+        int(s2_end_index),
+        int(next_s1_start_index),
+    )
+
+    nan_gap_delta = float(np.nan)
+    if s3_window is not None and s4_window is not None:
+        gap_start = int(s3_window[1])
+        gap_end = int(s4_window[0])
+        if gap_end - gap_start >= 2:
+            nan_gap_delta = _compute_segment_delta_value(amplitude, gap_start, gap_end)
+
+    return {
+        "Diastole_S3_Expected_Delta_mV": _compute_segment_delta_value(amplitude, *s3_window)
+        if s3_window is not None
+        else float(np.nan),
+        "Diastole_NaN_Gap_Delta_mV": nan_gap_delta,
+        "Diastole_S4_Expected_Delta_mV": _compute_segment_delta_value(amplitude, *s4_window)
+        if s4_window is not None
+        else float(np.nan),
+    }
+
+
+def _compute_diastole_parameter_row(
+    amplitude: np.ndarray,
+    s2_end_index: int,
+    next_s1_start_index: int,
+) -> dict[str, float]:
+    row = _compute_gap_parameter_row(
+        amplitude,
+        start_index=s2_end_index,
+        end_index=next_s1_start_index,
+        duration_key="Diastole_Duration_ms",
+        peak_key="Diastole_Peak_mV",
+        mean_key="Diastole_mean_mV",
+        nan_factory=lambda: _nan_row(DIASTOLE_PARAMETER_COLUMNS),
+    )
+    row.update(_compute_diastolic_expected_delta_row(amplitude, s2_end_index, next_s1_start_index))
+    return row
+
+
+def _get_rs_peak_value(signal: np.ndarray, event_index: int | None) -> float:
+    if event_index is None:
+        return float(np.nan)
+
+    safe_index = int(event_index)
+    if safe_index < 0 or safe_index >= len(signal):
+        return float(np.nan)
+
+    value = float(signal[safe_index])
+    if not np.isfinite(value):
+        return float(np.nan)
+    return float(int(round(value)))
+
+
+def _get_rs_width_bounds(signal: np.ndarray, event_index: int | None) -> tuple[int, int] | None:
+    if event_index is None:
+        return None
+
+    safe_index = int(event_index)
+    if safe_index < 0 or safe_index >= len(signal):
+        return None
+
+    peak_value = float(signal[safe_index])
+    if not np.isfinite(peak_value) or peak_value <= 0.0:
+        return None
+
+    threshold = 0.5 * peak_value
+    left_index = safe_index
+    while left_index - 1 >= 0:
+        next_value = float(signal[left_index - 1])
+        if not np.isfinite(next_value) or next_value < threshold:
+            break
+        left_index -= 1
+
+    right_index = safe_index
+    while right_index + 1 < len(signal):
+        next_value = float(signal[right_index + 1])
+        if not np.isfinite(next_value) or next_value < threshold:
+            break
+        right_index += 1
+
+    if left_index > right_index:
+        return None
+
+    return left_index, right_index
+
+
+def _get_rs_width_value(signal: np.ndarray, event_index: int | None) -> float:
+    bounds = _get_rs_width_bounds(signal, event_index)
+    if bounds is None:
+        return float(np.nan)
+
+    left_index, right_index = bounds
+    return float((right_index - left_index) * PreprocessConfig.SAMPLE_MS)
+
+
+def _get_rs_sumation_value(signal: np.ndarray, event_index: int | None) -> float:
+    bounds = _get_rs_width_bounds(signal, event_index)
+    if bounds is None:
+        return float(np.nan)
+
+    safe_index = int(event_index) if event_index is not None else -1
+    if safe_index < 0 or safe_index >= len(signal):
+        return float(np.nan)
+
+    left_index, right_index = bounds
+    segment = np.nan_to_num(signal[left_index : right_index + 1].astype(float, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    total = float(np.sum(np.abs(segment)))
+    peak_value = float(signal[safe_index])
+    if total <= 0.0 or not np.isfinite(peak_value):
+        return float(np.nan)
+    return float(abs(peak_value) / total)
+
+
+def _compute_rs_peak_parameter_row(
+    s1_start_signal: np.ndarray,
+    s1_end_signal: np.ndarray,
+    s2_start_signal: np.ndarray,
+    s2_end_signal: np.ndarray,
+    cycle_row: dict[str, Any],
+) -> dict[str, float]:
+    return {
+        "S1S_RS_Peak": _get_rs_peak_value(s1_start_signal, int(cycle_row["S1_start"])),
+        "S1E_RS_Peak": _get_rs_peak_value(s1_end_signal, int(cycle_row["S1_end"])),
+        "S2S_RS_Peak": _get_rs_peak_value(s2_start_signal, int(cycle_row["S2_start"])),
+        "S2E_RS_Peak": _get_rs_peak_value(s2_end_signal, int(cycle_row["S2_end"])),
+    }
+
+
+def _compute_rs_width_parameter_row(
+    s1_start_signal: np.ndarray,
+    s1_end_signal: np.ndarray,
+    s2_start_signal: np.ndarray,
+    s2_end_signal: np.ndarray,
+    cycle_row: dict[str, Any],
+) -> dict[str, float]:
+    return {
+        "S1S_RS_Width_ms": _get_rs_width_value(s1_start_signal, int(cycle_row["S1_start"])),
+        "S1E_RS_Width_ms": _get_rs_width_value(s1_end_signal, int(cycle_row["S1_end"])),
+        "S2S_RS_Width_ms": _get_rs_width_value(s2_start_signal, int(cycle_row["S2_start"])),
+        "S2E_RS_Width_ms": _get_rs_width_value(s2_end_signal, int(cycle_row["S2_end"])),
+    }
+
+
+def _compute_rs_sumation_parameter_row(
+    s1_start_signal: np.ndarray,
+    s1_end_signal: np.ndarray,
+    s2_start_signal: np.ndarray,
+    s2_end_signal: np.ndarray,
+    cycle_row: dict[str, Any],
+) -> dict[str, float]:
+    return {
+        "S1S_RS_Sumation": _get_rs_sumation_value(s1_start_signal, int(cycle_row["S1_start"])),
+        "S1E_RS_Sumation": _get_rs_sumation_value(s1_end_signal, int(cycle_row["S1_end"])),
+        "S2S_RS_Sumation": _get_rs_sumation_value(s2_start_signal, int(cycle_row["S2_start"])),
+        "S2E_RS_Sumation": _get_rs_sumation_value(s2_end_signal, int(cycle_row["S2_end"])),
+    }
+
+
+def _compute_heart_rate_row(s1_start_index: int, next_s1_start_index: int) -> dict[str, float]:
+    cycle_duration_ms = float((int(next_s1_start_index) - int(s1_start_index)) * PreprocessConfig.SAMPLE_MS)
+    if cycle_duration_ms <= 0.0:
+        return _nan_row(HEART_RATE_COLUMNS)
+
+    return {
+        "HeartRate_bpm": float(60000.0 / cycle_duration_ms),
+    }
+
+
+def _build_feature_row(
     record_id: str,
     source_file: str,
-    beat: dict[str, Any],
-    x: np.ndarray,
-    envelope: np.ndarray,
-    fs: int,
-    eps: float,
-    templates: dict[str, np.ndarray],
-    template_resample_length: int,
+    cycle_row: dict[str, Any],
+    amplitude: np.ndarray,
+    s1_start_signal: np.ndarray,
+    s1_end_signal: np.ndarray,
+    s2_start_signal: np.ndarray,
+    s2_end_signal: np.ndarray,
+    valid_flag: int,
+    invalid_reason: str,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "record_id": record_id,
         "source_file": source_file,
-        "beat_index": int(beat["beat_index"]),
-        "valid_flag": int(beat["valid_flag"]),
-        "invalid_reason": beat.get("invalid_reason", ""),
-        "s1_on": beat["s1_on"],
-        "s1_off": beat["s1_off"],
-        "s2_on": beat["s2_on"],
-        "s2_off": beat["s2_off"],
-        "s1_on_next": beat["s1_on_next"],
-        "s2_on_next": beat["s2_on_next"],
+        "beat_index": int(cycle_row["beat_index"]),
+        "cycle_index": int(cycle_row["cycle_index"]),
+        "valid_flag": int(valid_flag),
+        "invalid_reason": invalid_reason,
+        "S1_start": cycle_row["S1_start"],
+        "S1_end": cycle_row["S1_end"],
+        "S2_start": cycle_row["S2_start"],
+        "S2_end": cycle_row["S2_end"],
+        "next_S1_start": cycle_row["next_S1_start"],
+        "next_S1_end": cycle_row["next_S1_end"],
+        "s1_on": cycle_row["s1_on"],
+        "s1_off": cycle_row["s1_off"],
+        "s2_on": cycle_row["s2_on"],
+        "s2_off": cycle_row["s2_off"],
+        "s1_on_next": cycle_row["s1_on_next"],
     }
 
-    if int(beat["valid_flag"]) != 1:
-        row.update(nan_feature_map())
+    if valid_flag != 1:
+        row.update(_nan_feature_map())
         return row
 
     features: dict[str, float] = {}
-    features.update(compute_time_features(beat, fs))
-    features.update(compute_amplitude_energy_features(x, envelope, beat, fs, eps))
-    features.update(compute_shape_features(envelope, beat, fs, eps))
-    features.update(compute_statistics_complexity_features(x, beat, eps))
+    features.update(_compute_s1_parameter_row(amplitude, int(cycle_row["S1_start"]), int(cycle_row["S1_end"])))
+    features.update(_compute_s2_parameter_row(amplitude, int(cycle_row["S2_start"]), int(cycle_row["S2_end"])))
+    features.update(_compute_systole_parameter_row(amplitude, int(cycle_row["S1_end"]), int(cycle_row["S2_start"])))
+    features.update(_compute_diastole_parameter_row(amplitude, int(cycle_row["S2_end"]), int(cycle_row["next_S1_start"])))
     features.update(
-        compute_stability_features(
-            x=x,
-            beat=beat,
-            templates=templates,
-            template_resample_length=template_resample_length,
-            eps=eps,
+        _compute_rs_peak_parameter_row(
+            s1_start_signal,
+            s1_end_signal,
+            s2_start_signal,
+            s2_end_signal,
+            cycle_row,
         )
     )
+    features.update(
+        _compute_rs_width_parameter_row(
+            s1_start_signal,
+            s1_end_signal,
+            s2_start_signal,
+            s2_end_signal,
+            cycle_row,
+        )
+    )
+    features.update(
+        _compute_rs_sumation_parameter_row(
+            s1_start_signal,
+            s1_end_signal,
+            s2_start_signal,
+            s2_end_signal,
+            cycle_row,
+        )
+    )
+    features.update(_compute_heart_rate_row(int(cycle_row["S1_start"]), int(cycle_row["next_S1_start"])))
     row.update(features)
     return row
 
 
 def build_feature_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     dataframe = pd.DataFrame(rows)
-    ordered_columns = METADATA_COLUMNS + ALL_FEATURE_COLUMNS
+    ordered_columns = METADATA_COLUMNS + list(ALL_FEATURE_COLUMNS)
     missing_columns = [column for column in ordered_columns if column not in dataframe.columns]
     for column in missing_columns:
         dataframe[column] = np.nan
@@ -893,10 +962,7 @@ def summary_stat(values: np.ndarray, eps: float) -> dict[str, float]:
 
     std_value = float(np.std(values, ddof=0))
     mean_value = float(np.mean(values))
-    if values.size < 2:
-        rmssd = float(np.nan)
-    else:
-        rmssd = float(np.sqrt(np.mean(np.square(np.diff(values)))))
+    rmssd = float(np.sqrt(np.mean(np.square(np.diff(values))))) if values.size >= 2 else float(np.nan)
     return {
         "mean": mean_value,
         "std": std_value,
@@ -905,18 +971,15 @@ def summary_stat(values: np.ndarray, eps: float) -> dict[str, float]:
     }
 
 
-def build_record_summary(
-    feature_frame: pd.DataFrame,
-    eps: float,
-) -> pd.DataFrame:
+def build_record_summary(feature_frame: pd.DataFrame, eps: float) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for record_id, record_frame in feature_frame.groupby("record_id", sort=True):
         valid_frame = record_frame.loc[record_frame["valid_flag"] == 1].copy()
         row: dict[str, Any] = {
             "record_id": record_id,
-            "total_beats": int(len(record_frame)),
-            "valid_beats": int(len(valid_frame)),
-            "invalid_beats": int(len(record_frame) - len(valid_frame)),
+            "total_cycles": int(len(record_frame)),
+            "valid_cycles": int(len(valid_frame)),
+            "invalid_cycles": int(len(record_frame) - len(valid_frame)),
         }
         for column in SUMMARY_SOURCE_COLUMNS:
             stats = summary_stat(valid_frame[column].to_numpy(dtype=np.float64), eps)
@@ -928,8 +991,8 @@ def build_record_summary(
     return pd.DataFrame(rows)
 
 
-def build_learning_input_columns(feature_columns: list[str], excluded_columns: list[str]) -> list[str]:
-    return [column for column in feature_columns if column not in set(excluded_columns)]
+def build_learning_input_columns(feature_columns: list[str]) -> list[str]:
+    return list(feature_columns)
 
 
 def export_feature_outputs(
@@ -975,63 +1038,46 @@ def export_feature_outputs(
 def process_recording(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     record_id = parse_record_id(file_path)
     recording_table = load_recording_table(file_path, PreprocessConfig.EXPECTED_COLUMNS)
-    x = recording_table["Amplitude"].to_numpy(dtype=np.float32)
-    envelope = compute_smoothed_envelope(
-        x=x,
-        fs=PreprocessConfig.SAMPLING_RATE,
-        smooth_ms=PreprocessConfig.ENVELOPE_SMOOTH_MS,
-    )
+    amplitude = recording_table["Amplitude"].to_numpy(dtype=np.float32)
+    s1_start_signal = recording_table["S1-Start_RS_Score"].to_numpy(dtype=np.float32)
+    s1_end_signal = recording_table["S1-End_RS_Score"].to_numpy(dtype=np.float32)
+    s2_start_signal = recording_table["S2-Start_RS_Score"].to_numpy(dtype=np.float32)
+    s2_end_signal = recording_table["S2-End_RS_Score"].to_numpy(dtype=np.float32)
 
-    beats = load_boundaries_from_recording(recording_table)
-    logger.info("beat 수: record_id=%s, total_beats=%s", record_id, len(beats))
+    cycles = _build_cycles_from_recording(recording_table)
+    logger.info("cycle 수: record_id=%s, total_cycles=%s", record_id, len(cycles))
 
-    prepared_beats: list[dict[str, Any]] = []
-    for beat in beats:
-        is_valid, invalid_reason = validate_beat_boundaries(
-            beat=beat,
-            signal_length=len(x),
-            fs=PreprocessConfig.SAMPLING_RATE,
-            min_cycle_ms=PreprocessConfig.MIN_CYCLE_MS,
-            max_cycle_ms=PreprocessConfig.MAX_CYCLE_MS,
+    rows = []
+    valid_count = 0
+    for cycle_row in cycles:
+        is_valid, invalid_reason = _validate_cycle_boundaries(cycle_row, signal_length=len(amplitude))
+        valid_flag = int(is_valid)
+        if valid_flag == 1:
+            valid_count += 1
+        rows.append(
+            _build_feature_row(
+                record_id=record_id,
+                source_file=file_path.name,
+                cycle_row=cycle_row,
+                amplitude=amplitude,
+                s1_start_signal=s1_start_signal,
+                s1_end_signal=s1_end_signal,
+                s2_start_signal=s2_start_signal,
+                s2_end_signal=s2_end_signal,
+                valid_flag=valid_flag,
+                invalid_reason=invalid_reason,
+            )
         )
-        beat_copy = beat.copy()
-        beat_copy["valid_flag"] = int(is_valid)
-        beat_copy["invalid_reason"] = invalid_reason
-        prepared_beats.append(beat_copy)
 
-    valid_count = sum(int(beat["valid_flag"]) for beat in prepared_beats)
-    invalid_count = len(prepared_beats) - valid_count
+    invalid_count = len(cycles) - valid_count
     logger.info(
-        "valid / invalid beat 수: record_id=%s, valid=%s, invalid=%s",
+        "valid / invalid cycle 수: record_id=%s, valid=%s, invalid=%s",
         record_id,
         valid_count,
         invalid_count,
     )
 
-    templates = build_record_templates(
-        x=x,
-        beat_rows=prepared_beats,
-        template_resample_length=PreprocessConfig.TEMPLATE_RESAMPLE_LENGTH,
-        eps=PreprocessConfig.EPS,
-    )
-
-    rows = [
-        build_feature_row(
-            record_id=record_id,
-            source_file=file_path.name,
-            beat=beat,
-            x=x,
-            envelope=envelope,
-            fs=PreprocessConfig.SAMPLING_RATE,
-            eps=PreprocessConfig.EPS,
-            templates=templates,
-            template_resample_length=PreprocessConfig.TEMPLATE_RESAMPLE_LENGTH,
-        )
-        for beat in prepared_beats
-    ]
     feature_frame = build_feature_dataframe(rows)
-    logger.info("feature 추출 완료: record_id=%s", record_id)
-
     valid_frame = feature_frame.loc[feature_frame["valid_flag"] == 1].copy()
     return feature_frame, valid_frame
 
@@ -1047,9 +1093,7 @@ def collect_input_files(data_root: Path, file_glob: str, supported_suffixes: tup
 
 
 def main() -> None:
-    output_paths = ensure_output_directories(
-        stage_output_folder=configured_path(PreprocessConfig.OUTPUT_FOLDER),
-    )
+    output_paths = ensure_output_directories(stage_output_folder=configured_path(PreprocessConfig.OUTPUT_FOLDER))
 
     data_root = configured_path(PreprocessConfig.TRAIN_DATA_FOLDER)
     if not data_root.exists():
@@ -1074,21 +1118,16 @@ def main() -> None:
         all_valid_frames.append(valid_frame)
 
     beat_features_all = pd.concat(all_feature_frames, axis=0, ignore_index=True)
-    if PreprocessConfig.SAVE_INVALID_ROWS:
-        beat_features_all = beat_features_all.copy()
-    else:
+    if not PreprocessConfig.SAVE_INVALID_ROWS:
         beat_features_all = beat_features_all.loc[beat_features_all["valid_flag"] == 1].copy()
 
     beat_features_valid = pd.concat(all_valid_frames, axis=0, ignore_index=True)
-    feature_names = list(ALL_FEATURE_COLUMNS)
-    learning_input_columns = build_learning_input_columns(
-        feature_columns=feature_names,
-        excluded_columns=PreprocessConfig.LEARNING_INPUT_EXCLUDE_COLUMNS,
-    )
-    record_summary = build_record_summary(beat_features_all, eps=PreprocessConfig.EPS)
+    if beat_features_valid.empty:
+        raise ValueError("No valid cycles were extracted from the provided recordings.")
 
-    logger.info("학습 입력 feature 수: %s", len(learning_input_columns))
-    logger.info("제외된 column 목록: %s", PreprocessConfig.LEARNING_INPUT_EXCLUDE_COLUMNS)
+    feature_names = list(ALL_FEATURE_COLUMNS)
+    learning_input_columns = build_learning_input_columns(feature_names)
+    record_summary = build_record_summary(beat_features_all, eps=PreprocessConfig.EPS)
 
     export_feature_outputs(
         preprocess_root=output_paths["preprocess_root"],
