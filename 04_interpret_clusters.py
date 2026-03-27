@@ -51,10 +51,10 @@ class InterpretationConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
 
     # 아래 3개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
-    PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
-    CLUSTERING_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\clustering"
-    TRAIN_DATA_FOLDER = r"C:\Users\LUI\Desktop\PCG\Data\Train 학습데이터(260109)"
-    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\interpretation"
+    PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260325"
+    CLUSTERING_INPUT_FOLDER = r"C:\Users\LUI\Desktop\Heart-Sound-Unsupervised-Model-main\2. Train\260327"
+    TRAIN_DATA_FOLDER = r"C:\Users\LUI\Desktop\Heart-Sound-Unsupervised-Model-main\3. Cluster\260327"
+    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\Heart-Sound-Unsupervised-Model-main\Result\260327"
 
     TOP_FEATURES_PER_CLUSTER = 10
     REPRESENTATIVE_BEATS_PER_CLUSTER = 5

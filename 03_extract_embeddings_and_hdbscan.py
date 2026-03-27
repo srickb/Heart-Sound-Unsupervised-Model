@@ -47,9 +47,9 @@ class ClusteringConfig:
     PROJECT_ROOT = Path(__file__).resolve().parent
 
     # 아래 2개 경로만 윈도우 절대경로로 직접 수정해서 사용하세요.
-    PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\preprocess"
-    TRAINING_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\training"
-    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260310\clustering"
+    PREPROCESS_INPUT_FOLDER = r"C:\Users\LUI\Desktop\PCG\processed_data\260325"
+    TRAINING_INPUT_FOLDER = r"C:\Users\LUI\Desktop\Heart-Sound-Unsupervised-Model-main\2. Train\260327"
+    OUTPUT_FOLDER = r"C:\Users\LUI\Desktop\Heart-Sound-Unsupervised-Model-main\3. Cluster\260327"
 
     RANDOM_SEED = 42
     MIN_CLUSTER_SIZE = 25
