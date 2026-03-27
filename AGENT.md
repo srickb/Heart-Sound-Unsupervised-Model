@@ -315,7 +315,24 @@ logger = logging.getLogger(__name__)
 
 Use `logger.info`, `logger.warning`, and `logger.error` where appropriate.
 
-For loops over many files, use `tqdm` if the surrounding script style already does so.
+For loops over many files, epochs, batches, representative export tasks, or workbook sheet generation,
+use `tqdm` by default unless the loop is truly trivial.
+
+Progress visibility is part of the repository's default UX.
+If a script may take noticeable time, the user should be able to see that it is moving forward.
+
+Preferred pattern:
+
+- define a config flag such as `SHOW_PROGRESS = True`
+- wrap long-running loops with `tqdm(..., disable=not config.SHOW_PROGRESS)`
+- keep progress labels explicit, for example:
+  - `Processing files`
+  - `Training epochs`
+  - `Generating RS scores`
+  - `Saving representative figures`
+  - `Writing Excel sheets`
+
+Do not silently remove visible progress reporting from existing script-style pipelines unless explicitly requested.
 
 For per-file batch processing, it is acceptable to use `try/except` so one broken file does not stop the entire run.
 
@@ -429,6 +446,7 @@ Before finalizing any code change, verify all of the following:
 - input dimensions still match built features
 - `EVENT_NAMES` are identical across related files
 - preprocessing, training, inference, and evaluation still agree on schema
+- long-running loops still expose visible progress when appropriate
 
 If there is any mismatch, fix the mismatch before finishing.
 
@@ -449,3 +467,10 @@ If the requested change would break compatibility across layers, update all affe
 The default assumption is:
 
 maintain the repo’s existing script-first PCG pipeline style unless the user clearly requests a new architecture.
+
+When updating long-running pipeline scripts, default to preserving or adding:
+
+- repo-style logging
+- section divider comments
+- config-controlled progress bars
+- readable top-to-bottom execution flow

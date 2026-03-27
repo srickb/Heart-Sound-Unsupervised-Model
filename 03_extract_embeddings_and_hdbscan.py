@@ -32,6 +32,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, **_kwargs):
+        return iterable
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -53,6 +58,7 @@ class ClusteringConfig:
     CLUSTER_SELECTION_METHOD = "eom"
     PREDICTION_DATA_ENABLED = True
     EXEMPLARS_PER_CLUSTER = 5
+    SHOW_PROGRESS = True
 
     BEAT_FEATURES_FILENAME = "beat_features_valid.csv"
     LEARNING_INPUT_COLUMNS_FILENAME = "learning_input_columns.json"
@@ -332,7 +338,11 @@ def compute_nearest_cluster_features(
 
     nearest_labels: list[int] = []
     nearest_distances: list[float] = []
-    for row_vector in latent_matrix:
+    for row_vector in tqdm(
+        latent_matrix,
+        desc="Nearest cluster distances",
+        disable=not ClusteringConfig.SHOW_PROGRESS,
+    ):
         distances = np.linalg.norm(reference_matrix - row_vector[None, :], axis=1)
         best_index = int(np.argmin(distances))
         nearest_labels.append(int(reference_labels[best_index]))
@@ -394,7 +404,12 @@ def compute_cluster_exemplars(
         )
 
     rows: list[dict[str, Any]] = []
-    for cluster_label, cluster_frame in clustered_train.groupby("cluster_label", sort=True):
+    cluster_iterator = tqdm(
+        clustered_train.groupby("cluster_label", sort=True),
+        desc="Selecting exemplars",
+        disable=not ClusteringConfig.SHOW_PROGRESS,
+    )
+    for cluster_label, cluster_frame in cluster_iterator:
         cluster_matrix = cluster_frame.loc[:, latent_columns].to_numpy(dtype=np.float32)
         cluster_center = cluster_matrix.mean(axis=0, dtype=np.float32)
         distances = np.linalg.norm(cluster_matrix - cluster_center[None, :], axis=1)
@@ -422,7 +437,13 @@ def compute_cluster_stability_summary(
     persistence = getattr(clusterer, "cluster_persistence_", np.array([], dtype=np.float32))
 
     rows: list[dict[str, Any]] = []
-    for index, cluster_label in enumerate(unique_cluster_labels):
+    for index, cluster_label in enumerate(
+        tqdm(
+            unique_cluster_labels,
+            desc="Cluster stability summary",
+            disable=not ClusteringConfig.SHOW_PROGRESS,
+        )
+    ):
         cluster_frame = train_assignments.loc[train_assignments["cluster_label"] == cluster_label]
         rows.append(
             {
@@ -468,7 +489,12 @@ def compute_record_distribution_summary(
     frame: pd.DataFrame,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
-    for cluster_label, cluster_frame in frame.groupby("cluster_label", sort=True):
+    cluster_iterator = tqdm(
+        frame.groupby("cluster_label", sort=True),
+        desc="Record bias summary",
+        disable=not ClusteringConfig.SHOW_PROGRESS,
+    )
+    for cluster_label, cluster_frame in cluster_iterator:
         record_counts = cluster_frame["record_id"].astype(str).value_counts()
         rows.append(
             {

@@ -28,6 +28,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, **_kwargs):
+        return iterable
 
 from excel_export_utils import export_stage_workbook
 
@@ -83,6 +88,7 @@ class PreprocessConfig:
     EXPORT_CSV = True
     EXPORT_FEATURE_NAMES_JSON = True
     SAVE_INVALID_ROWS = True
+    SHOW_PROGRESS = True
     EXCEL_FILENAME = "preprocess_export.xlsx"
     EXCEL_FREEZE_PANES = "A2"
     EXCEL_HEADER_FILL = "1F4E78"
@@ -1353,7 +1359,11 @@ def main() -> None:
 
     all_feature_frames: list[pd.DataFrame] = []
     all_valid_frames: list[pd.DataFrame] = []
-    for file_path in file_paths:
+    for file_path in tqdm(
+        file_paths,
+        desc="Preprocess files",
+        disable=not PreprocessConfig.SHOW_PROGRESS,
+    ):
         feature_frame, valid_frame = process_recording(file_path)
         all_feature_frames.append(feature_frame)
         all_valid_frames.append(valid_frame)

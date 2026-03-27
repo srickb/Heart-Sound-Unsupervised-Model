@@ -33,6 +33,11 @@ import torch
 from sklearn.preprocessing import RobustScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, **_kwargs):
+        return iterable
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -59,6 +64,7 @@ class TrainingConfig:
     TRAIN_RATIO = 0.70
     VAL_RATIO = 0.15
     TEST_RATIO = 0.15
+    SHOW_PROGRESS = True
 
     BEAT_FEATURES_FILENAME = "beat_features_valid.csv"
     LEARNING_INPUT_COLUMNS_FILENAME = "learning_input_columns.json"
@@ -418,7 +424,12 @@ def train_denoising_autoencoder(
     history_rows: list[dict[str, float | int]] = []
     patience_counter = 0
 
-    for epoch in range(1, config.MAX_EPOCHS + 1):
+    epoch_iterator = tqdm(
+        range(1, config.MAX_EPOCHS + 1),
+        desc="DAE epochs",
+        disable=not config.SHOW_PROGRESS,
+    )
+    for epoch in epoch_iterator:
         model.train()
         train_loss_sum = 0.0
         train_count = 0
@@ -452,6 +463,8 @@ def train_denoising_autoencoder(
                 "val_loss": val_loss,
             }
         )
+        if hasattr(epoch_iterator, "set_postfix"):
+            epoch_iterator.set_postfix(train=f"{train_loss:.6f}", val=f"{val_loss:.6f}")
         logger.info("epoch=%s train_loss=%.8f val_loss=%.8f", epoch, train_loss, val_loss)
 
         if val_loss < best_val_loss:

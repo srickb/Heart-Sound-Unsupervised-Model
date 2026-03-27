@@ -34,6 +34,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable=None, **_kwargs):
+        return iterable
 
 from excel_export_utils import export_stage_workbook
 
@@ -57,6 +62,7 @@ class InterpretationConfig:
     SAMPLING_RATE = 4000.0
     EPS = 1e-8
     CSV_ENCODING_CANDIDATES = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
+    SHOW_PROGRESS = True
 
     BEAT_FEATURES_VALID_FILENAME = "beat_features_valid.csv"
     LEARNING_INPUT_COLUMNS_FILENAME = "learning_input_columns.json"
@@ -320,7 +326,11 @@ def compute_feature_summary(
     rows: list[dict[str, Any]] = []
     cluster_labels = get_dynamic_cluster_labels(clustered_valid_beats)
 
-    for feature_name in learning_input_columns:
+    for feature_name in tqdm(
+        learning_input_columns,
+        desc="Feature summary",
+        disable=not InterpretationConfig.SHOW_PROGRESS,
+    ):
         global_values = clustered_valid_beats[feature_name].to_numpy(dtype=np.float64)
         rows.append(
             {
@@ -358,7 +368,11 @@ def compute_top_features_per_cluster(
     global_means = clustered_valid_beats.loc[:, learning_input_columns].mean(axis=0)
     global_stds = clustered_valid_beats.loc[:, learning_input_columns].std(axis=0, ddof=0)
 
-    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+    for cluster_label in tqdm(
+        get_dynamic_cluster_labels(clustered_valid_beats),
+        desc="Top features",
+        disable=not InterpretationConfig.SHOW_PROGRESS,
+    ):
         if cluster_label == -1:
             continue
         cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label]
@@ -402,7 +416,11 @@ def compute_feature_group_summary(
     global_stds = clustered_valid_beats.loc[:, learning_input_columns].std(axis=0, ddof=0)
     summary: dict[str, dict[str, Any]] = {}
 
-    for cluster_label in get_dynamic_cluster_labels(clustered_valid_beats):
+    for cluster_label in tqdm(
+        get_dynamic_cluster_labels(clustered_valid_beats),
+        desc="Feature groups",
+        disable=not InterpretationConfig.SHOW_PROGRESS,
+    ):
         cluster_frame = clustered_valid_beats.loc[clustered_valid_beats["analysis_cluster_label"] == cluster_label]
         cluster_summary: dict[str, Any] = {}
         if cluster_frame.empty:
@@ -711,7 +729,13 @@ def build_representative_beats(
 
     try:
         cached_signals: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for row_index, row in representative_beats.iterrows():
+        row_iterator = tqdm(
+            representative_beats.iterrows(),
+            total=len(representative_beats),
+            desc="Representative figures",
+            disable=not InterpretationConfig.SHOW_PROGRESS,
+        )
+        for row_index, row in row_iterator:
             source_file = str(row["source_file"])
             source_path = data_root / source_file
             if source_file not in cached_signals:
